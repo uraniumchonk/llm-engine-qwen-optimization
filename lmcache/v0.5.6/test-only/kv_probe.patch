@@ -1,0 +1,289 @@
+diff --git a/lmcache/v1/multiprocess/modules/lmcache_driven_transfer.py b/lmcache/v1/multiprocess/modules/lmcache_driven_transfer.py
+index 88a04c0..d722de2 100644
+--- a/lmcache/v1/multiprocess/modules/lmcache_driven_transfer.py
++++ b/lmcache/v1/multiprocess/modules/lmcache_driven_transfer.py
+@@ -4,9 +4,14 @@
+ # Standard
+ from dataclasses import dataclass
+ from typing import Any, Sequence
++import hashlib
++import os
+ import threading
+ import time
+ 
++# Third Party
++import torch
++
+ # First Party
+ from lmcache import torch_dev
+ from lmcache.logging import init_logger
+@@ -51,6 +56,173 @@ import lmcache.lmcache_native as lmcache_native
+ 
+ logger = init_logger(__name__)
+ 
++# LMCACHE_MEOW_KV_PROBE=1 (server env) logs a GPU checksum of every
++# paged block a store reads and a retrieve writes, per chunk and kernel group,
++# so a test can match retrieve-after-H2D against store byte for byte. Retrieve
++# first poisons its target blocks, and the padded tail beyond each view, so a
++# block that merely still holds the stored bytes cannot pass, and a write past
++# the view shows up as tail_ok=False. Test-only: it synchronizes the stream.
++#
++# One MEOWPROBE line per object group per chunk. Digests are that group's
++# kernel groups in kernel_group_indices order. With a single object group
++# (the default) that order is every kernel group, which is the 0.5.4rc5 line.
++_MEOW_KV_PROBE = os.environ.get("LMCACHE_MEOW_KV_PROBE", "0") == "1"
++_MEOW_NULL_BLOCK_ID = 0
++_MEOW_VIEW_POISON = 0x5A
++_MEOW_TAIL_POISON_U8 = 0xA5
++_meow_weights: dict[tuple[str, int], torch.Tensor] = {}
++
++
++def _meow_tail(tensor: torch.Tensor) -> torch.Tensor | None:
++    """Return ``[num_blocks, tail]`` over the bytes between a block's view
++    and the next block, or ``None`` when the view has no dim-0 padding or is
++    not a 1-byte dtype."""
++    if tensor.element_size() != 1 or tensor.ndim < 2:
++        return None
++    view_elems = tensor[0].numel()
++    stride0 = tensor.stride(0)
++    if stride0 <= view_elems:
++        return None
++    rows = torch.as_strided(
++        tensor, (tensor.shape[0], stride0), (stride0, 1), tensor.storage_offset()
++    )
++    return rows[:, view_elems:]
++
++
++def _meow_tail_poison(tensor: torch.Tensor) -> int:
++    return _MEOW_TAIL_POISON_U8 if tensor.dtype == torch.uint8 else (
++        _MEOW_TAIL_POISON_U8 - 256
++    )
++
++
++def _meow_checksum(region: torch.Tensor) -> list[torch.Tensor]:
++    """Byte sum and position-weighted byte sum of ``region`` (GPU scalars)."""
++    flat = region.contiguous().reshape(-1).view(torch.uint8).to(torch.int64)
++    key = (str(flat.device), flat.numel())
++    weights = _meow_weights.get(key)
++    if weights is None:
++        weights = torch.arange(
++            1, flat.numel() + 1, dtype=torch.int64, device=flat.device
++        )
++        _meow_weights[key] = weights
++    return [flat.sum(), (flat * weights).sum()]
++
++
++def _meow_chunk_blocks(
++    raw_block_ids: list[list[int]],
++    blocks_per_chunk: list[int],
++    kernel_group_idx: int,
++    chunk_idx: int,
++) -> list[int]:
++    bpc = blocks_per_chunk[kernel_group_idx]
++    return raw_block_ids[kernel_group_idx][chunk_idx * bpc : (chunk_idx + 1) * bpc]
++
++
++def _meow_poison_targets(
++    cache_context: BaseCacheContext,
++    raw_block_ids: list[list[int]],
++    blocks_per_chunk: list[int],
++    chunk_indices_per_group: list[list[int]],
++) -> None:
++    """Fill the retrieve target blocks' views and tails with poison bytes.
++
++    ``chunk_indices_per_group[g]`` is the chunks whose H2D write covers
++    object group ``g``. Kernel groups outside that object group are left
++    alone, so a separate-object-group retrieve does not poison a plane
++    this call will not overwrite.
++    """
++    manager = cache_context.kv_layer_groups_manager
++    tensors = cache_context.kv_tensors
++    for obj_group, chunk_indices in zip(
++        manager.object_groups, chunk_indices_per_group, strict=True
++    ):
++        for chunk_idx in chunk_indices:
++            for kg_idx in obj_group.kernel_group_indices:
++                group = manager.kernel_groups[kg_idx]
++                for block_id in _meow_chunk_blocks(
++                    raw_block_ids, blocks_per_chunk, kg_idx, chunk_idx
++                ):
++                    if block_id == _MEOW_NULL_BLOCK_ID:
++                        continue
++                    for layer_idx in group.layer_indices:
++                        tensor = tensors[layer_idx]
++                        tensor[block_id].fill_(_MEOW_VIEW_POISON)
++                        tail = _meow_tail(tensor)
++                        if tail is not None:
++                            tail[block_id].fill_(_meow_tail_poison(tensor))
++
++
++def _meow_probe_log(
++    op: str,
++    cache_context: BaseCacheContext,
++    raw_block_ids: list[list[int]],
++    blocks_per_chunk: list[int],
++    obj_keys_per_obj_group: list[list[ObjectKey]],
++    chunk_indices_per_group: list[list[int]],
++) -> None:
++    """Log one ``MEOWPROBE`` line per object group per chunk.
++
++    Digests are one token per kernel group of that object group, in
++    ``kernel_group_indices`` order (``null`` when every block id is the
++    null block). On retrieve, ``tail_ok`` is whether every padded tail
++    kept its poison. The line format matches the 0.5.4rc5 probe.
++    """
++    torch_dev.current_stream().synchronize()
++    manager = cache_context.kv_layer_groups_manager
++    tensors = cache_context.kv_tensors
++    for group_pos, obj_group in enumerate(manager.object_groups):
++        for chunk_idx in chunk_indices_per_group[group_pos]:
++            scalars: list[torch.Tensor] = []
++            layout: list[int] = []
++            tail_checks: list[torch.Tensor] = []
++            for kg_idx in obj_group.kernel_group_indices:
++                group = manager.kernel_groups[kg_idx]
++                count = 0
++                for block_id in _meow_chunk_blocks(
++                    raw_block_ids, blocks_per_chunk, kg_idx, chunk_idx
++                ):
++                    if block_id == _MEOW_NULL_BLOCK_ID:
++                        continue
++                    for layer_idx in group.layer_indices:
++                        tensor = tensors[layer_idx]
++                        scalars.extend(_meow_checksum(tensor[block_id]))
++                        count += 2
++                        if op == "retrieve":
++                            tail = _meow_tail(tensor)
++                            if tail is not None:
++                                tail_checks.append(
++                                    (tail[block_id] != _meow_tail_poison(tensor)).any()
++                                )
++                layout.append(count)
++            values = torch.stack(scalars).tolist() if scalars else []
++            digests = []
++            offset = 0
++            for count in layout:
++                if count == 0:
++                    digests.append("null")
++                    continue
++                part = values[offset : offset + count]
++                offset += count
++                digests.append(
++                    hashlib.blake2b(repr(part).encode(), digest_size=6).hexdigest()
++                )
++            if op == "retrieve":
++                tail_ok = str(not any(torch.stack(tail_checks).tolist())) if (
++                    tail_checks
++                ) else "-"
++            else:
++                tail_ok = "-"
++            obj_key = obj_keys_per_obj_group[group_pos][chunk_idx]
++            logger.info(
++                "MEOWPROBE op=%s rank=%d chunk=%s idx=%d digests=%s tail_ok=%s",
++                op,
++                obj_key.kv_rank,
++                obj_key.chunk_hash.hex()[:16],
++                chunk_idx,
++                ",".join(digests),
++                tail_ok,
++            )
++
+ 
+ def get_layout_desc(
+     cache_context: BaseCacheContext,
+@@ -695,6 +867,9 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
+                 null_block_id,
+             )
+ 
++            meow_raw_block_ids = (
++                [list(ids) for ids in gpu_block_ids] if _MEOW_KV_PROBE else []
++            )
+             block_ids_per_group_gpu = downsample_and_stage_block_ids(
+                 cache_context, gpu_block_ids
+             )
+@@ -796,6 +971,25 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
+                     else []
+                 )
+                 store_succeeded = True
++                if _MEOW_KV_PROBE:
++                    try:
++                        _meow_probe_log(
++                            "store",
++                            cache_context,
++                            meow_raw_block_ids,
++                            blocks_per_chunk,
++                            obj_keys_per_obj_group,
++                            [
++                                [
++                                    i
++                                    for i in range(num_chunks)
++                                    if not skipped_chunks[g][i]
++                                ]
++                                for g in range(num_object_groups)
++                            ],
++                        )
++                    except Exception:
++                        logger.exception("MEOWPROBE store probe failed")
+             except Exception:
+                 logger.exception("Cannot store keys due to exception")
+             finally:
+@@ -981,6 +1175,9 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
+                 event_backend.record_event(event, cache_context.stream)
+                 return event_backend.export_event(event, cache_context.device), False
+ 
++            meow_raw_block_ids = (
++                [list(ids) for ids in gpu_block_ids] if _MEOW_KV_PROBE else []
++            )
+             # Cut and stage all block_ids to GPU once before the transfer
+             block_ids_per_group_gpu = downsample_and_stage_block_ids(
+                 cache_context, gpu_block_ids
+@@ -1017,6 +1214,30 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
+                 if g not in skipped_groups
+             )
+ 
++            meow_chunks: list[list[int]] = []
++            if _MEOW_KV_PROBE:
++                # Chunks this group's H2D fully overwrites: past that group's
++                # sliding-window skip and past the engine's already-computed
++                # prefix. Aux groups are not transferred here, so they are
++                # not poisoned. One object group reproduces the rc5 range.
++                apc_skip = -(-skip_first_n_tokens // self._ctx.chunk_size)
++                meow_chunks = [
++                    []
++                    if g in skipped_groups
++                    else list(range(max(group_skips[g], apc_skip), num_chunks))
++                    for g in range(num_object_groups)
++                ]
++                try:
++                    _meow_poison_targets(
++                        cache_context,
++                        meow_raw_block_ids,
++                        blocks_per_chunk,
++                        meow_chunks,
++                    )
++                except Exception:
++                    logger.exception("MEOWPROBE poison failed")
++                    meow_chunks = []
++
+             prefetched_keys: list[ObjectKey] = []
+             read_owners = self._ctx.get_read_owners(key.request_id)
+             retained_keys = [
+@@ -1061,6 +1282,18 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
+                         block_ids_host=gpu_block_ids,
+                     )
+                     prefetched_keys.extend(in_window_keys)
++                if _MEOW_KV_PROBE and retrieve_succeeded and any(meow_chunks):
++                    try:
++                        _meow_probe_log(
++                            "retrieve",
++                            cache_context,
++                            meow_raw_block_ids,
++                            blocks_per_chunk,
++                            obj_keys_per_obj_group,
++                            meow_chunks,
++                        )
++                    except Exception:
++                        logger.exception("MEOWPROBE retrieve probe failed")
+             except Exception:
+                 logger.exception("Cannot retrieve keys due to exception")
+                 retrieve_succeeded = False

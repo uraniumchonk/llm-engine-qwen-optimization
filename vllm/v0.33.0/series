@@ -1,0 +1,5 @@
+E003-triton-fp8-sw-dequant.patch
+E005-group-size.patch
+E006a-in-proj-ba-small-m.patch
+E006b-gdn-spec-views.patch
+E006c-small-m-custom-op.patch

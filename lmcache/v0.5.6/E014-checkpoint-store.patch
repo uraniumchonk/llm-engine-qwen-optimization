@@ -1,0 +1,465 @@
+diff --git a/lmcache/integration/vllm/lmcache_mp_connector.py b/lmcache/integration/vllm/lmcache_mp_connector.py
+index a5f5896..dbdfbf7 100644
+--- a/lmcache/integration/vllm/lmcache_mp_connector.py
++++ b/lmcache/integration/vllm/lmcache_mp_connector.py
+@@ -63,6 +63,11 @@ from lmcache.integration.vllm.kv_cache_groups import (
+     get_tokens_per_block,
+     is_scratch_spec,
+ )
++from lmcache.integration.vllm.meow_checkpoint import (
++    apply_store_checkpoint,
++    meow_ckpt_k_from_env,
++    roles_from_kv_cache_groups,
++)
+ from lmcache.integration.vllm.lazy_offload_manager import LazyOffloadManager
+ from lmcache.integration.vllm.lmcache_mp_metadata import (
+     LMCacheMPConnectorMetadata,
+@@ -802,6 +807,24 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
+                 f"group tokens_per_block {group_tokens_per_block} must be "
+                 "non-negative with at least one cacheable group"
+             )
++        # Checkpoint store. 0 keeps today's store. Roles follow the vLLM
++        # group specs; null ids are applied on the scheduler store ops below.
++        self._meow_ckpt_k = meow_ckpt_k_from_env()
++        role_groups = (
++            getattr(kv_cache_config, "kv_cache_groups", ()) or ()
++            if kv_cache_config is not None
++            else ()
++        )
++        self._meow_ckpt_roles = roles_from_kv_cache_groups(role_groups)
++        if self._meow_ckpt_k > 0:
++            logger.info(
++                "LMCACHE_MEOW_CKPT_K=%d roles=%s null_block_id=0. "
++                "Use with server --separate-object-groups: one combined "
++                "object group stays live via attention ids and would copy "
++                "block 0 for a nulled group.",
++                self._meow_ckpt_k,
++                [role.kind for role in self._meow_ckpt_roles],
++            )
+         # Smallest token count aligned to every group's paged-chunk
+         # boundary; used to round down vLLM APC hit counts.
+         self._hit_alignment_tokens = math.lcm(*cached_spans)
+@@ -1669,6 +1692,33 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
+     ##############################
+     # Helper functions
+     ##############################
++    def _apply_meow_checkpoint(self, r_meta, tracker):
++        """Null non-checkpoint GDN and drafter block ids on a store op.
++
++        ``LMCACHE_MEOW_CKPT_K`` unset or 0 returns the metadata unchanged.
++        The worker expands the engine-group lists to kernel groups. The
++        server drops an object-group chunk only when every kernel group in
++        it is the null block, so every GDN engine group is nulled together.
++        """
++        if r_meta is None or self._meow_ckpt_k <= 0:
++            return r_meta
++        try:
++            r_meta.op.block_ids = apply_store_checkpoint(
++                r_meta.op.block_ids,
++                self._meow_ckpt_roles,
++                start_token=r_meta.op.start,
++                end_token=r_meta.op.end,
++                num_prompt_tokens=tracker.num_prompt_tokens,
++                chunk_size=self.scheduler_adapter.lmcache_tokens_per_chunk,
++                tokens_per_block=self._group_tokens_per_block,
++                k=self._meow_ckpt_k,
++            )
++        except Exception as exc:  # fail open: store every chunk as without the switch
++            if not getattr(self, "_meow_ckpt_warned", False):
++                self._meow_ckpt_warned = True
++                logger.warning("LMCACHE_MEOW_CKPT_K: checkpoint nulling skipped, storing all chunks: %r", exc)
++        return r_meta
++
+     def _process_retrieve_requests(
+         self,
+         metadata: LMCacheMPConnectorMetadata,
+@@ -1709,6 +1759,7 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
+                 self._group_tokens_per_block,
+                 save_decode_cache=self._save_decode_cache,
+             )
++            r_meta = self._apply_meow_checkpoint(r_meta, request_tracker)
+             if r_meta is not None:
+                 # In lazy_offload mode, add to pending queue instead of immediate store
+                 if self.lazy_offload:
+@@ -1749,6 +1800,7 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
+                 save_decode_cache=self._save_decode_cache,
+             )
+ 
++            r_meta = self._apply_meow_checkpoint(r_meta, request_tracker)
+             if r_meta is not None:
+                 # In lazy_offload mode, add to pending queue instead of immediate store
+                 if self.lazy_offload:
+diff --git a/lmcache/integration/vllm/meow_checkpoint.py b/lmcache/integration/vllm/meow_checkpoint.py
+new file mode 100644
+index 0000000..972861f
+--- /dev/null
++++ b/lmcache/integration/vllm/meow_checkpoint.py
+@@ -0,0 +1,368 @@
++"""Checkpoint-only store of GDN and drafter chunks on LMCache 0.5.6.
++
++The scheduler nulls engine-group block ids. The server already skips an
++object-group chunk whose kernel groups are all the null block
++(``all_null_chunk_masks``). Attention ids are never written.
++
++Switch: env ``LMCACHE_MEOW_CKPT_K``. Unset or 0 stores every chunk.
++A positive ``K`` keeps a GDN chunk ``i`` when ``(i + 1) % K == 0`` or
++``i`` is the last full chunk of the request prompt. A drafter chunk is
++kept when it sits in the ``ceil(sliding_window / chunk_size)`` chunks
++ending at a kept GDN chunk.
++
++The null id is 0, the server default. This matches ``--separate-object-groups``.
++With that flag off, one object group holds attention together with GDN, the
++all-null mask stays false, and a nulled id is read as block 0.
++"""
++
++from __future__ import annotations
++
++from dataclasses import dataclass
++import os
++
++
++_GDN = "gdn"
++_DRAFTER = "drafter"
++_ATTENTION = "attention"
++_SCRATCH = "scratch"
++_NULL_BLOCK_ID = 0
++
++
++@dataclass(frozen=True)
++class GroupRole:
++    """One engine group's store role.
++
++    ``window_tokens`` is the drafter sliding window. It is 0 for the
++    other roles.
++    """
++
++    kind: str
++    window_tokens: int = 0
++
++
++def meow_ckpt_k_from_env(raw: str | None = None) -> int:
++    """Return ``LMCACHE_MEOW_CKPT_K``.
++
++    Unset, empty, and ``0`` return 0 (store every chunk). A positive
++    integer is the period. Any other string raises ``ValueError``.
++
++    Args:
++        raw: Value to parse. ``None`` reads the environment.
++    """
++    if raw is None:
++        raw = os.environ.get("LMCACHE_MEOW_CKPT_K")
++    if raw is None:
++        return 0
++    text = raw.strip()
++    if text == "" or text == "0":
++        return 0
++    try:
++        k = int(text)
++    except ValueError as exc:
++        raise ValueError(
++            f"LMCACHE_MEOW_CKPT_K must be an integer, got {raw!r}"
++        ) from exc
++    if k < 0:
++        raise ValueError(f"LMCACHE_MEOW_CKPT_K must be >= 0, got {k}")
++    return k
++
++
++def _class_names(spec: object) -> set[str]:
++    return {cls.__name__ for cls in type(spec).__mro__}
++
++
++def _leaf_specs(group: object) -> list[object]:
++    """Unwrap ``UniformTypeKVCacheSpecs`` the way ``kv_cache_groups`` does."""
++    spec = getattr(group, "kv_cache_spec", group)
++    inner = getattr(spec, "kv_cache_specs", None)
++    if isinstance(inner, dict) and inner:
++        return list(inner.values())
++    return [spec]
++
++
++def _is_scratch(leaves: list[object]) -> bool:
++    """True when the group is not prefix-cacheable.
++
++    Matches ``is_scratch_spec``: a missing attribute means cacheable.
++    """
++    if not leaves:
++        return False
++    return not getattr(leaves[0], "prefix_cacheable", True)
++
++
++def roles_from_kv_cache_groups(groups: object) -> list[GroupRole]:
++    """Classify each vLLM KV-cache group.
++
++    ``MambaSpec`` with ``mamba_cache_mode`` ``align`` or ``all`` is GDN.
++    That is the same mode gate as ``_is_cachable_mamba_spec``. A
++    ``SlidingWindowSpec`` leaf with ``is_draft`` is the drafter, and its
++    ``sliding_window`` is kept in tokens. Anything else is attention and
++    is stored for every chunk.
++
++    Args:
++        groups: ``kv_cache_config.kv_cache_groups``, or an empty sequence.
++
++    Raises:
++        ValueError: If one group mixes drafter windows.
++    """
++    roles: list[GroupRole] = []
++    for group in groups or ():
++        leaves = _leaf_specs(group)
++        if _is_scratch(leaves):
++            roles.append(GroupRole(_SCRATCH))
++            continue
++        if any(
++            "MambaSpec" in _class_names(leaf)
++            and getattr(leaf, "mamba_cache_mode", "none") in ("align", "all")
++            for leaf in leaves
++        ):
++            roles.append(GroupRole(_GDN))
++            continue
++        windows: set[int] = set()
++        for leaf in leaves:
++            if "SlidingWindowSpec" not in _class_names(leaf):
++                continue
++            if not getattr(leaf, "is_draft", False):
++                continue
++            windows.add(int(getattr(leaf, "sliding_window")))
++        if not windows:
++            roles.append(GroupRole(_ATTENTION))
++            continue
++        if len(windows) != 1:
++            raise ValueError(
++                f"drafter group has more than one sliding window: {sorted(windows)}"
++            )
++        window = windows.pop()
++        if window <= 0:
++            raise ValueError(
++                f"draft sliding window must be positive, got {window}"
++            )
++        roles.append(GroupRole(_DRAFTER, window))
++    return roles
++
++
++def _gdn_kept(horizon: int, num_prompt_chunks: int, k: int) -> set[int]:
++    """Chunk indices in ``[0, horizon)`` whose GDN snapshot is stored."""
++    if k < 1:
++        raise ValueError(f"k must be >= 1, got {k}")
++    last = num_prompt_chunks - 1 if num_prompt_chunks > 0 else None
++    kept: set[int] = set()
++    for index in range(horizon):
++        if (index + 1) % k == 0 or index == last:
++            kept.add(index)
++    return kept
++
++
++def _drafter_kept(gdn_kept: set[int], window_chunks: int) -> set[int]:
++    """Union of the ``window_chunks`` ending at each kept GDN chunk."""
++    if window_chunks < 1:
++        raise ValueError(f"window_chunks must be >= 1, got {window_chunks}")
++    kept: set[int] = set()
++    for checkpoint in gdn_kept:
++        start = max(0, checkpoint - window_chunks + 1)
++        kept.update(range(start, checkpoint + 1))
++    return kept
++
++
++def apply_store_checkpoint(
++    block_ids: list[list[int]],
++    roles: list[GroupRole],
++    *,
++    start_token: int,
++    end_token: int,
++    num_prompt_tokens: int,
++    chunk_size: int,
++    tokens_per_block: list[int],
++    k: int,
++    null_block_id: int = _NULL_BLOCK_ID,
++) -> list[list[int]]:
++    """Return store block ids with non-checkpoint GDN and drafter chunks nulled.
++
++    ``k <= 0`` returns ``block_ids`` itself. A positive ``k`` returns new
++    lists. Attention and scratch groups are copied unchanged. A dropped
++    chunk's block ids, all of them when a chunk spans more than one block,
++    become ``null_block_id``.
++
++    The keep set uses the whole prompt, not only this store's slice, so a
++    one-chunk step keeps a drafter chunk whose GDN checkpoint is a later
++    chunk of the same prompt.
++
++    Args:
++        block_ids: One list per engine group, already sliced to the store.
++        roles: Parallel to ``block_ids``.
++        start_token: Inclusive token index of the store. Chunk-aligned.
++        end_token: Exclusive token index of the store. Chunk-aligned.
++        num_prompt_tokens: Request prompt length. The last full chunk is
++            ``num_prompt_tokens // chunk_size - 1`` when that is non-negative.
++        chunk_size: LMCache tokens per chunk.
++        tokens_per_block: Per-engine-group tokens per block id. ``0`` is scratch.
++        k: Checkpoint period. ``0`` disables nulling.
++        null_block_id: Server null block. Default 0.
++
++    Raises:
++        ValueError: On a misaligned range, a length mismatch, or a short list.
++    """
++    if k <= 0:
++        return block_ids
++    if chunk_size < 1:
++        raise ValueError(f"chunk_size must be >= 1, got {chunk_size}")
++    if len(block_ids) != len(roles) or len(tokens_per_block) != len(roles):
++        raise ValueError(
++            "block_ids, roles, and tokens_per_block must have the same length, "
++            f"got {len(block_ids)}, {len(roles)}, {len(tokens_per_block)}"
++        )
++    if start_token % chunk_size != 0 or end_token % chunk_size != 0:
++        raise ValueError(
++            f"store range [{start_token}, {end_token}) is not aligned to "
++            f"chunk_size {chunk_size}"
++        )
++    if end_token < start_token:
++        raise ValueError(
++            f"store range [{start_token}, {end_token}) is inverted"
++        )
++    num_local = (end_token - start_token) // chunk_size
++    start_chunk = start_token // chunk_size
++    num_prompt_chunks = num_prompt_tokens // chunk_size
++    horizon = max(num_prompt_chunks, start_chunk + num_local)
++    gdn_kept = _gdn_kept(horizon, num_prompt_chunks, k)
++    out: list[list[int]] = []
++    for group_ids, role, tokens in zip(block_ids, roles, tokens_per_block, strict=True):
++        if role.kind in (_ATTENTION, _SCRATCH) or tokens <= 0:
++            out.append(list(group_ids))
++            continue
++        if chunk_size % tokens != 0:
++            raise ValueError(
++                f"chunk_size {chunk_size} is not a multiple of tokens_per_block {tokens}"
++            )
++        blocks_per_chunk = chunk_size // tokens
++        need = num_local * blocks_per_chunk
++        if len(group_ids) < need:
++            raise ValueError(
++                f"{role.kind} block-id list has {len(group_ids)} ids, "
++                f"store needs {need}"
++            )
++        if role.kind == _GDN:
++            kept = gdn_kept
++        elif role.kind == _DRAFTER:
++            window_chunks = (role.window_tokens + chunk_size - 1) // chunk_size
++            kept = _drafter_kept(gdn_kept, window_chunks)
++        else:
++            raise ValueError(f"unknown group role {role.kind!r}")
++        rewritten = list(group_ids)
++        for local in range(num_local):
++            if start_chunk + local in kept:
++                continue
++            begin = local * blocks_per_chunk
++            rewritten[begin : begin + blocks_per_chunk] = [null_block_id] * blocks_per_chunk
++        out.append(rewritten)
++    return out
++
++
++def _storable_tokens(
++    tracker: object,
++    tokens_per_block: list[int],
++    *,
++    save_decode_cache: bool,
++) -> int:
++    """Token cap used by ``GetStoreMetadata`` before the chunk division.
++
++    The formula is ``lmcache_mp_metadata.py`` ``GetStoreMetadata``: the
++    computed-token upper bound, the shortest cacheable allocation, then
++    the prompt cap when decode chunks are not stored.
++    """
++    computed = tracker.num_scheduled_tokens + max(
++        tracker.num_vllm_hit_tokens, tracker.num_lmcache_hit_tokens
++    )
++    allocated = tracker.allocated_block_ids
++    allocated_tokens = min(
++        (
++            len(allocated.get(index, ())) * tokens
++            for index, tokens in enumerate(tokens_per_block)
++            if tokens > 0
++        ),
++        default=0,
++    )
++    available = min(len(tracker.all_token_ids), allocated_tokens, computed)
++    if not save_decode_cache:
++        available = min(available, tracker.num_prompt_tokens)
++    max_offload = getattr(tracker, "max_offload_tokens", None)
++    if max_offload is not None:
++        available = min(available, max_offload)
++    return available
++
++
++def _slice_group(
++    allocated: dict[int, list[int]],
++    tokens_per_block: list[int],
++    start_token: int,
++    end_token: int,
++) -> list[list[int]]:
++    """Slice each engine group the way ``slice_block_ids_per_group`` does."""
++    sliced: list[list[int]] = []
++    for index, tokens in enumerate(tokens_per_block):
++        if tokens <= 0:
++            sliced.append([])
++            continue
++        if start_token % tokens != 0 or end_token % tokens != 0:
++            raise ValueError(
++                f"token range [{start_token}, {end_token}) does not align to "
++                f"group {index} tokens_per_block {tokens}"
++            )
++        ids = allocated.get(index, [])
++        sliced.append(list(ids[start_token // tokens : end_token // tokens]))
++    return sliced
++
++
++def store_block_ids_for_tracker(
++    tracker: object,
++    roles: list[GroupRole],
++    tokens_per_block: list[int],
++    chunk_size: int,
++    k: int,
++    *,
++    save_decode_cache: bool = False,
++) -> list[list[int]] | None:
++    """Build this step's store block ids, or ``None`` when no chunk is stored.
++
++    Advances ``tracker.num_stored_tokens`` by the stored token count, which
++    is what ``GetStoreMetadata`` does after it accepts a store. A prompt
++    shorter than one chunk, or a step that adds no new full chunk, returns
++    ``None`` and does not advance the counter.
++
++    Args:
++        tracker: Object with the ``LMCacheMPRequestTracker`` fields this
++            function reads.
++        roles: Engine-group roles, parallel to ``tokens_per_block``.
++        tokens_per_block: Tokens covered by one block id of each group.
++        chunk_size: LMCache tokens per chunk.
++        k: Checkpoint period. ``0`` leaves the sliced ids unchanged.
++        save_decode_cache: When false, generated tokens are not stored.
++    """
++    if len(roles) != len(tokens_per_block):
++        raise ValueError(
++            f"roles ({len(roles)}) and tokens_per_block ({len(tokens_per_block)}) differ"
++        )
++    available = _storable_tokens(
++        tracker, tokens_per_block, save_decode_cache=save_decode_cache
++    )
++    start = tracker.num_stored_tokens
++    num_chunks = (available - start) // chunk_size
++    if num_chunks < 1:
++        return None
++    end = start + num_chunks * chunk_size
++    block_ids = _slice_group(
++        tracker.allocated_block_ids, tokens_per_block, start, end
++    )
++    if k > 0:
++        block_ids = apply_store_checkpoint(
++            block_ids,
++            roles,
++            start_token=start,
++            end_token=end,
++            num_prompt_tokens=tracker.num_prompt_tokens,
++            chunk_size=chunk_size,
++            tokens_per_block=tokens_per_block,
++            k=k,
++        )
++    tracker.num_stored_tokens = end
++    return block_ids

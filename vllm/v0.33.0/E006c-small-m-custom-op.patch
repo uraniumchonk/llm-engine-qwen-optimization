@@ -1,0 +1,87 @@
+diff --git a/vllm/model_executor/layers/linear.py b/vllm/model_executor/layers/linear.py
+index da617a4..17788ba 100644
+--- a/vllm/model_executor/layers/linear.py
++++ b/vllm/model_executor/layers/linear.py
+@@ -5,6 +5,8 @@ from abc import abstractmethod
+ from collections.abc import Callable, Iterable
+ from typing import Any
+ 
++import os
++
+ import torch
+ from torch.nn.parameter import Parameter
+ from typing_extensions import TypeIs
+@@ -241,18 +243,16 @@ class UnquantizedLinearMethod(LinearMethodBase):
+             return linear_batch_invariant(x, layer.weight, bias)
+         # in_proj_ba sets this. M<=16, N narrow, K long: F.linear picks a
+         # 16x16 WMMA tile (E002-a, 34.7 us at M=8, N=48, K=5120).
++        # E006c: the M <= 16 test runs inside the custom op at run time; a
++        # Python shape test here is fixed once by torch.compile tracing.
+         if (
+             getattr(layer, "small_m_bf16_gemm", False)
++            and bias is None
+             and x.dtype == torch.bfloat16
+             and layer.weight.dtype == torch.bfloat16
+             and x.ndim == 2
+-            and 0 < x.shape[0] <= 16
+         ):
+-            from vllm.model_executor.layers.mamba.gdn.small_m_bf16_gemm import (
+-                small_m_bf16_linear,
+-            )
+-
+-            return small_m_bf16_linear(x, layer.weight, bias)
++            return torch.ops.vllm.small_m_bf16_linear(x, layer.weight)
+         return self._gemm_impl(layer, x, layer.weight, bias)
+ 
+ 
+diff --git a/vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py b/vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py
+index f6637b8..5cb90c0 100644
+--- a/vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py
++++ b/vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py
+@@ -51,6 +51,8 @@ from vllm.model_executor.layers.mamba.ops.causal_conv1d import (
+     causal_conv1d_fn,
+     causal_conv1d_update,
+ )
++# E006c: importing registers torch.ops.vllm.small_m_bf16_linear
++import vllm.model_executor.layers.mamba.gdn.small_m_bf16_gemm  # noqa: F401
+ from vllm.model_executor.layers.quantization import QuantizationConfig
+ from vllm.model_executor.layers.quantization.auto_awq import AutoAWQConfig
+ from vllm.model_executor.layers.quantization.auto_gptq import AutoGPTQConfig
+diff --git a/vllm/model_executor/layers/mamba/gdn/small_m_bf16_gemm.py b/vllm/model_executor/layers/mamba/gdn/small_m_bf16_gemm.py
+index b2d7e5e..3a9dd51 100644
+--- a/vllm/model_executor/layers/mamba/gdn/small_m_bf16_gemm.py
++++ b/vllm/model_executor/layers/mamba/gdn/small_m_bf16_gemm.py
+@@ -147,3 +147,33 @@ def small_m_bf16_linear(
+     if bias is not None:
+         y = y + bias.float()
+     return y.to(x.dtype)
++
++
++# E006c: torch.compile traces UnquantizedLinearMethod.apply with a symbolic M
++# (the general graph is traced at max_num_batched_tokens), so a Python
++# `x.shape[0] <= 16` test there is resolved once at trace time and the
++# compiled graph always calls F.linear (E008-a: no _small_m_splitk_kernel in
++# the 0.33 trace). Registering the call as an opaque custom op moves the
++# M <= MAX_M dispatch to run time, including CUDA-graph capture per size.
++_E006_ON = __import__("os").environ.get("VLLM_E006_SMALL_M", "1") != "0"
++
++
++def _small_m_bf16_linear_op(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
++    # The switch is read here (run time): an env var is not part of the
++    # torch.compile AOT cache key, so a trace-time check would be reused.
++    if not _E006_ON:
++        return torch.nn.functional.linear(x, weight)
++    return small_m_bf16_linear(x, weight, None)
++
++
++def _small_m_bf16_linear_fake(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
++    return x.new_empty((x.shape[0], weight.shape[0]))
++
++
++from vllm.utils.torch_utils import direct_register_custom_op  # noqa: E402
++
++direct_register_custom_op(
++    op_name="small_m_bf16_linear",
++    op_func=_small_m_bf16_linear_op,
++    fake_impl=_small_m_bf16_linear_fake,
++)

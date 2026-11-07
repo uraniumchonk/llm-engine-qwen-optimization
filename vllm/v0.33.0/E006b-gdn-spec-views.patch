@@ -1,0 +1,277 @@
+--- a/vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py
++++ b/vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py
+@@ -540,6 +540,56 @@
+         return o, final_state
+ 
+ 
++def strided_qkv_views(
++    mixed_qkv: torch.Tensor,
++    q_dim: int,
++    k_dim: int,
++    v_dim: int,
++    head_k_dim: int,
++    head_v_dim: int,
++    seq_len: int,
++) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
++    """q, k, v as (1, seq, heads, dim).
++
++    Last-dim stride 1: views into ``mixed_qkv``. Element (t, h, d) of q is
++    ``mixed_qkv[t, h * head_k_dim + d]``; k starts at column ``q_dim``; v
++    starts at column ``q_dim + k_dim``. Otherwise one contiguous copy each.
++    """
++    if (
++        mixed_qkv.ndim == 2
++        and mixed_qkv.stride(-1) == 1
++        and q_dim % head_k_dim == 0
++        and k_dim % head_k_dim == 0
++        and v_dim % head_v_dim == 0
++    ):
++        h = q_dim // head_k_dim
++        vh = v_dim // head_v_dim
++        row_stride = mixed_qkv.stride(0)
++        base_off = mixed_qkv.storage_offset()
++        query = mixed_qkv.as_strided(
++            (1, seq_len, h, head_k_dim),
++            (0, row_stride, head_k_dim, 1),
++            storage_offset=base_off,
++        )
++        key = mixed_qkv.as_strided(
++            (1, seq_len, h, head_k_dim),
++            (0, row_stride, head_k_dim, 1),
++            storage_offset=base_off + q_dim,
++        )
++        value = mixed_qkv.as_strided(
++            (1, seq_len, vh, head_v_dim),
++            (0, row_stride, head_v_dim, 1),
++            storage_offset=base_off + q_dim + k_dim,
++        )
++        return query, key, value
++
++    query, key, value = torch.split(mixed_qkv, [q_dim, k_dim, v_dim], dim=-1)
++    query = query.contiguous().view(1, seq_len, -1, head_k_dim)
++    key = key.contiguous().view(1, seq_len, -1, head_k_dim)
++    value = value.contiguous().view(1, seq_len, -1, head_v_dim)
++    return query, key, value
++
++
+ @PluggableLayer.register("qwen_gated_delta_net_attention")
+ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
+     def get_state_shape(
+@@ -1040,13 +1093,11 @@
+         return mixed_qkv_out, z_out, b_out, a_out
+ 
+     def rearrange_mixed_qkv(self, mixed_qkv):
+-        """Split packed qkv into contiguous (1, seq, heads, dim) tensors.
++        """Split packed qkv into (1, seq, heads, dim) tensors.
+ 
+-        The original code used ``rearrange(x, "l (h d) -> 1 l h d", d=...)``
+-        followed by ``.contiguous()`` on each tensor.  This version flattens
+-        all three splits into a single buffer via ``torch.cat`` so that
+-        torch.compile emits one Triton copy kernel instead of three separate
+-        contiguous() calls.
++        Last-dim-contiguous input returns views. The sigmoid kernel reads
++        them with token and head strides. A non-contiguous last dim is
++        copied once per tensor.
+         """
+         if mixed_qkv is None:
+             return None, None, None
+@@ -1055,26 +1106,16 @@
+         q_dim = self.key_dim // self.tp_size
+         k_dim = self.key_dim // self.tp_size
+         v_dim = self.value_dim // self.tp_size
+-
+-        query, key, value = torch.split(mixed_qkv, [q_dim, k_dim, v_dim], dim=-1)
+-
+-        fused = torch.cat(
+-            [query.reshape(-1), key.reshape(-1), value.reshape(-1)], dim=0
++        return strided_qkv_views(
++            mixed_qkv,
++            q_dim,
++            k_dim,
++            v_dim,
++            self.head_k_dim,
++            self.head_v_dim,
++            seq_len,
+         )
+ 
+-        q_size = seq_len * q_dim
+-        k_size = seq_len * k_dim
+-
+-        q_contig = fused[0:q_size]
+-        k_contig = fused[q_size : q_size + k_size]
+-        v_contig = fused[q_size + k_size :]
+-
+-        query = q_contig.view(1, seq_len, -1, self.head_k_dim)
+-        key = k_contig.view(1, seq_len, -1, self.head_k_dim)
+-        value = v_contig.view(1, seq_len, -1, self.head_v_dim)
+-
+-        return query, key, value
+-
+     def forward(
+         self,
+         hidden_states: torch.Tensor,
+@@ -1197,8 +1238,8 @@
+ 
+         torch.ops.vllm.qwen_gdn_attention_core(
+             mixed_qkv,
+-            b.contiguous(),
+-            a.contiguous(),
++            b,
++            a,
+             core_attn_out,
+             layer_name=_encode_layer_name(self.prefix),
+         )
+@@ -2228,8 +2269,8 @@
+             return
+         self._forward_core(
+             mixed_qkv=mixed_qkv,
+-            b=b.contiguous(),
+-            a=a.contiguous(),
++            b=b,
++            a=a,
+             core_attn_out=core_attn_out,
+         )
+         num_actual_tokens = attn_metadata.num_actual_tokens
+--- a/vllm/third_party/flash_linear_attention/ops/fused_sigmoid_gating.py
++++ b/vllm/third_party/flash_linear_attention/ops/fused_sigmoid_gating.py
+@@ -38,6 +38,16 @@
+     ssm_state_indices,
+     num_accepted_tokens,
+     scale,
++    stride_q_token,
++    stride_q_head,
++    stride_k_token,
++    stride_k_head,
++    stride_v_token,
++    stride_v_head,
++    stride_a_token,
++    stride_a_head,
++    stride_b_token,
++    stride_b_head,
+     N: tl.int64,  # num of sequences
+     T: tl.int64,  # num of tokens
+     B: tl.constexpr,
+@@ -80,19 +90,24 @@
+     o_k = i_k * BK + tl.arange(0, BK)
+     o_v = i_v * BV + tl.arange(0, BV)
+ 
+-    p_q = q + (bos * H + i_h) * K + o_k
+-    p_k = k + (bos * H + i_h) * K + o_k
+-    p_v = v + (bos * HV + i_hv) * V + o_v
+-
+-    p_A_log = A_log + i_hv
+-    if not IS_KDA:
+-        p_a = a + bos * HV + i_hv
+-        p_dt_bias = dt_bias + i_hv
+-    else:
++    # IS_KDA keeps the packed pointer math (callers pass contiguous tensors).
++    # Otherwise token/head strides address a view whose rows are not packed.
++    if IS_KDA:
++        p_q = q + (bos * H + i_h) * K + o_k
++        p_k = k + (bos * H + i_h) * K + o_k
++        p_v = v + (bos * HV + i_hv) * V + o_v
+         p_a = a + (bos * HV + i_hv) * K + o_k
+         p_dt_bias = dt_bias + i_hv * K + o_k
++        p_b = b + bos * HV + i_hv
++    else:
++        p_q = q + bos * stride_q_token + i_h * stride_q_head + o_k
++        p_k = k + bos * stride_k_token + i_h * stride_k_head + o_k
++        p_v = v + bos * stride_v_token + i_hv * stride_v_head + o_v
++        p_a = a + bos * stride_a_token + i_hv * stride_a_head
++        p_dt_bias = dt_bias + i_hv
++        p_b = b + bos * stride_b_token + i_hv * stride_b_head
+ 
+-    p_b = b + bos * HV + i_hv
++    p_A_log = A_log + i_hv
+     p_o = o + ((i_k * all + bos) * HV + i_hv) * V + o_v
+ 
+     mask_k = o_k < K
+@@ -170,12 +185,19 @@
+             tl.store(p_ht, b_h.to(p_ht.dtype.element_ty), mask=mask_h)
+ 
+         # Update pointers for next timestep
+-        p_q += H * K
+-        p_k += H * K
+         p_o += HV * V
+-        p_v += HV * V
+-        p_b += HV
+-        p_a += HV
++        if IS_KDA:
++            p_q += H * K
++            p_k += H * K
++            p_v += HV * V
++            p_b += HV
++            p_a += HV
++        else:
++            p_q += stride_q_token
++            p_k += stride_k_token
++            p_v += stride_v_token
++            p_b += stride_b_token
++            p_a += stride_a_token
+ 
+ 
+ def fused_sigmoid_gating_delta_rule_update(
+@@ -238,17 +260,41 @@
+     else:
+         stride_indices_seq, stride_indices_tok = ssm_state_indices.stride()
+ 
++    def _qkv_strides(t: torch.Tensor) -> tuple[torch.Tensor, int, int]:
++        # Last-dim stride must be 1: o_k is a unit-stride vector load.
++        if t.ndim != 4 or t.stride(-1) != 1:
++            t = t.contiguous()
++        return t, t.stride(-3), t.stride(-2)
++
++    def _ab_strides(t: torch.Tensor) -> tuple[torch.Tensor, int, int]:
++        # Token axis is -2 for both [T, HV] and [1, T, HV].
++        if t.ndim < 2 or t.stride(-1) != 1:
++            t = t.contiguous()
++        return t, t.stride(-2), t.stride(-1)
++
++    if is_kda:
++        q = q.contiguous()
++        k = k.contiguous()
++        v = v.contiguous()
++        a = a.contiguous()
++        b = b.contiguous()
++    q, stride_q_token, stride_q_head = _qkv_strides(q)
++    k, stride_k_token, stride_k_head = _qkv_strides(k)
++    v, stride_v_token, stride_v_head = _qkv_strides(v)
++    a, stride_a_token, stride_a_head = _ab_strides(a)
++    b, stride_b_token, stride_b_head = _ab_strides(b)
++
+     grid = (NK, NV, N * HV)
+     fused_sigmoid_gating_delta_rule_update_kernel[grid](
+         A_log=A_log,
+-        a=a.contiguous(),
+-        b=b.contiguous(),
++        a=a,
++        b=b,
+         dt_bias=dt_bias,
+         beta=beta,
+         threshold=threshold,
+-        q=q.contiguous(),
+-        k=k.contiguous(),
+-        v=v.contiguous(),
++        q=q,
++        k=k,
++        v=v,
+         o=o,
+         h0=initial_state,
+         ht=final_state,
+@@ -256,6 +302,16 @@
+         ssm_state_indices=ssm_state_indices,
+         num_accepted_tokens=num_accepted_tokens,
+         scale=scale,
++        stride_q_token=stride_q_token,
++        stride_q_head=stride_q_head,
++        stride_k_token=stride_k_token,
++        stride_k_head=stride_k_head,
++        stride_v_token=stride_v_token,
++        stride_v_head=stride_v_head,
++        stride_a_token=stride_a_token,
++        stride_a_head=stride_a_head,
++        stride_b_token=stride_b_token,
++        stride_b_head=stride_b_head,
+         N=N,
+         T=T,
+         B=B,

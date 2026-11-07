@@ -1,0 +1,196 @@
+--- a/vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py
++++ b/vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py
+@@ -841,7 +891,7 @@
+         output_sizes = (
+             [num_v_heads * 2] if self.gqa_interleaved_layout else [num_v_heads] * 2
+         )
+-        return MergedColumnParallelLinear(
++        linear = MergedColumnParallelLinear(
+             input_size=hidden_size,
+             output_sizes=output_sizes,
+             bias=False,
+@@ -849,6 +899,9 @@
+             prefix=prefix,
+             disable_tp=self.maybe_disable_tp(quant_config),
+         )
++        # Read by UnquantizedLinearMethod.apply. Quantized methods ignore it.
++        linear.small_m_bf16_gemm = True
++        return linear
+ 
+     def maybe_disable_tp(self, quant_config: QuantizationConfig | None) -> bool:
+         """Whether to replicate ba_proj instead of TP-sharding it.
+--- a/vllm/model_executor/layers/linear.py
++++ b/vllm/model_executor/layers/linear.py
+@@ -239,6 +239,20 @@
+             current_platform.is_cuda_alike() or current_platform.is_xpu()
+         ):
+             return linear_batch_invariant(x, layer.weight, bias)
++        # in_proj_ba sets this. M<=16, N narrow, K long: F.linear picks a
++        # 16x16 WMMA tile (E002-a, 34.7 us at M=8, N=48, K=5120).
++        if (
++            getattr(layer, "small_m_bf16_gemm", False)
++            and x.dtype == torch.bfloat16
++            and layer.weight.dtype == torch.bfloat16
++            and x.ndim == 2
++            and 0 < x.shape[0] <= 16
++        ):
++            from vllm.model_executor.layers.mamba.gdn.small_m_bf16_gemm import (
++                small_m_bf16_linear,
++            )
++
++            return small_m_bf16_linear(x, layer.weight, bias)
+         return self._gemm_impl(layer, x, layer.weight, bias)
+ 
+ 
+--- a/vllm/model_executor/layers/mamba/gdn/small_m_bf16_gemm.py
++++ b/vllm/model_executor/layers/mamba/gdn/small_m_bf16_gemm.py
+@@ -0,0 +1,149 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""BF16 GEMM for a short M and a narrow N.
++
++``F.linear`` on in_proj_ba at M=8, N=48, K=5120 dispatches a 4-CTA
++16x16 WMMA kernel (E002-a: 34.7 us/call). This kernel splits K and
++accumulates in fp32:
++
++    Y[m, n] = sum_k X[m, k] * W[n, k]
++
++``W`` is the linear weight, shape [N, K], the same layout as
++``torch.nn.functional.linear``. Partial sums along K are exact integer
++sums in the CPU indexing check (out006/tests/test_e006_indexing.py); on GPU
++each K tile is a bf16 tensor-core dot into fp32, then the splits are
++added in fp32 and rounded to bf16.
++
++Indexing contract, locked to that test:
++    SPLIT_K, BLOCK_N, BLOCK_K below
++    k_per = ceil(K / SPLIT_K)
++    partial[s, m, n] = sum of X[m, k] * W[n, k]
++        for k in [s * k_per, min((s + 1) * k_per, K))
++    Y[m, n] = sum_s partial[s, m, n]
++    X index: m * stride_xm + k * stride_xk
++    W index: n * stride_wn + k * stride_wk
++"""
++
++from __future__ import annotations
++
++import torch
++
++from vllm.triton_utils import tl, triton
++
++# Keep these three in lockstep with out006/tests/test_e006_indexing.py.
++SPLIT_K = 32
++BLOCK_N = 16
++BLOCK_K = 64
++BLOCK_M = 16
++MAX_M = 16
++
++
++@triton.jit
++def _small_m_splitk_kernel(
++    x_ptr,
++    w_ptr,
++    partial_ptr,
++    M,
++    N,
++    K,
++    stride_xm,
++    stride_xk,
++    stride_wn,
++    stride_wk,
++    stride_ps,
++    stride_pm,
++    stride_pn,
++    k_per,
++    BLOCK_M: tl.constexpr,
++    BLOCK_N: tl.constexpr,
++    BLOCK_K: tl.constexpr,
++):
++    pid_n = tl.program_id(0)
++    pid_k = tl.program_id(1)
++    offs_m = tl.arange(0, BLOCK_M)
++    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
++    mask_m = offs_m < M
++    mask_n = offs_n < N
++    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
++    k_start = pid_k * k_per
++    k_end = tl.minimum(k_start + k_per, K)
++    # Tiles past K store zeros. k_end == k_start makes the range empty.
++    for k0 in tl.range(k_start, k_end, BLOCK_K):
++        offs_k = k0 + tl.arange(0, BLOCK_K)
++        mask_k = offs_k < k_end
++        x = tl.load(
++            x_ptr + offs_m[:, None] * stride_xm + offs_k[None, :] * stride_xk,
++            mask=mask_m[:, None] & mask_k[None, :],
++            other=0,
++        )
++        w = tl.load(
++            w_ptr + offs_n[:, None] * stride_wn + offs_k[None, :] * stride_wk,
++            mask=mask_n[:, None] & mask_k[None, :],
++            other=0,
++        )
++        acc = tl.dot(x, tl.trans(w), acc)
++    tl.store(
++        partial_ptr
++        + pid_k * stride_ps
++        + offs_m[:, None] * stride_pm
++        + offs_n[None, :] * stride_pn,
++        acc,
++        mask=mask_m[:, None] & mask_n[None, :],
++    )
++
++
++def small_m_bf16_linear(
++    x: torch.Tensor,
++    weight: torch.Tensor,
++    bias: torch.Tensor | None = None,
++) -> torch.Tensor:
++    """Y = x @ weight.T (+ bias), bf16 in, fp32 accumulate, bf16 out.
++
++    ``x`` is [M, K], ``weight`` is [N, K]. M > 16, or a dtype other than
++    bf16, falls through to ``F.linear``.
++    """
++    if (
++        x.dtype != torch.bfloat16
++        or weight.dtype != torch.bfloat16
++        or x.ndim != 2
++        or weight.ndim != 2
++        or x.shape[1] != weight.shape[1]
++        or x.shape[0] > MAX_M
++        or x.shape[0] == 0
++        or weight.shape[0] == 0
++    ):
++        return torch.nn.functional.linear(x, weight, bias)
++
++    m, k = x.shape
++    n = weight.shape[0]
++    k_per = triton.cdiv(k, SPLIT_K)
++    # Pad so masked rows/cols of the tile still have in-range addresses.
++    n_pad = triton.cdiv(n, BLOCK_N) * BLOCK_N
++    partial = torch.empty(
++        (SPLIT_K, BLOCK_M, n_pad), dtype=torch.float32, device=x.device
++    )
++    grid = (triton.cdiv(n, BLOCK_N), SPLIT_K)
++    _small_m_splitk_kernel[grid](
++        x,
++        weight,
++        partial,
++        m,
++        n,
++        k,
++        x.stride(0),
++        x.stride(1),
++        weight.stride(0),
++        weight.stride(1),
++        partial.stride(0),
++        partial.stride(1),
++        partial.stride(2),
++        k_per,
++        BLOCK_M=BLOCK_M,
++        BLOCK_N=BLOCK_N,
++        BLOCK_K=BLOCK_K,
++        num_warps=4,
++    )
++    y = partial[:, :m, :n].sum(dim=0)
++    if bias is not None:
++        y = y + bias.float()
++    return y.to(x.dtype)
