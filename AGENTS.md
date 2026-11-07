@@ -108,6 +108,29 @@ and a wrong answer sounds as sure as a right one. Answer from the repo:
 | What does this layer, flag or backend do here? | [engine-internals](skills/engine-internals/SKILL.md) index, then its reference |
 | Is my number comparable to yours? | [measurement](skills/measurement/SKILL.md) rules, [traps](skills/measurement/references/traps.md) |
 
+**Assume you do not know.** Treat your own knowledge of kernels and GPU features as
+unverified for this stack. When the repo does not settle a question, tell your human you
+have not verified it. Quantization is the most common trap: a scheme's name says how
+weights and activations are stored, not what the tensor cores compute.
+
+- W4A16 and W8A16 (int4 or int8 weights, 16-bit activations): the kernel unpacks the
+  weights in registers and multiplies in bf16/fp16, so int8 tensor cores stay idle; the
+  gain is memory bandwidth. vLLM 0.33's Marlin takes 4-bit and 8-bit weights from SM75 up
+  (`query_marlin_supported_quant_types` in `marlin_utils.py`); our W4A16 runs on Marlin
+  (E022).
+- W8A8 int8: activations are quantized to int8 as well, and vLLM 0.33 routes the layer to
+  cutlass int8 `scaled_mm`, which uses int8 tensor cores on Ampere (code read, not
+  measured here).
+- W8A8 fp8 below SM89, such as a 3090: vLLM 0.33 logs "Your GPU does not have native
+  support for FP8 computation ... Weight-only FP8 compression will be used leveraging the
+  Marlin kernel" (`marlin_utils_fp8.py`) and runs fp8 weights with 16-bit math.
+- int8 vs fp8 activations: which loses more accuracy depends on the model and its
+  calibration; we have not measured it on this model.
+- fp8 KV cache on sm86 is a storage format; the math stays 16-bit (E003).
+- Evidence of the path that ran is the start-log kernel line or warning and the kernel
+  names in an nsys trace. A scheme name, a config field or a model card shows the storage
+  format only.
+
 Answers that memory gets wrong on this stack, all measured:
 
 - "Triton can use fp8 KV on a 3090." Triton 3.7.1 could not compile fp8e4nv loads or
