@@ -70,6 +70,7 @@ Pick one route, load its skill, and follow it.
 | Apply a patch set to an installed engine or a source checkout, our model and rig | [skills/apply-patch-set](skills/apply-patch-set/SKILL.md) | the model README, the version folder's cards |
 | Port the approach to your own GPUs, model, drafter or quantization | [skills/port-to-your-hardware](skills/port-to-your-hardware/SKILL.md) | its derive-constants reference, the cards' "Keep when porting" lines |
 | Research a new model or engine version the way we did | [skills/optimization-method](skills/optimization-method/SKILL.md) | [skills/measurement](skills/measurement/SKILL.md), [skills/engine-internals](skills/engine-internals/SKILL.md) |
+| Answer a question about this stack | [Answering questions](#answering-questions) below | the file its table names |
 
 Read order for any route:
 
@@ -82,6 +83,43 @@ Read order for any route:
 4. The route's skill, then the references it names.
 5. Before you compare any number with ours: [skills/measurement](skills/measurement/SKILL.md)
    and [qwen3.8-27b/results](qwen3.8-27b/results/README.md).
+
+## Answering questions
+
+This stack was studied down to each kernel and the GPU feature it runs on: tensor-core
+modes, fp8 support, tile shapes, PCIe peer access, what torch.compile freezes at trace
+time. At that depth, general knowledge about vLLM or GPUs is often wrong for this setup,
+and a wrong answer sounds as sure as a right one. Answer from the repo:
+
+1. Find the fact in the file the table below names, and read the run it cites.
+2. Quote what was measured with its experiment id, setup, engine version and date.
+   Label an estimate "estimate, not measured" and give its arithmetic.
+3. When the repo has no measurement for the question, say "not measured here" and name
+   the measurement that would answer it ([measurement](skills/measurement/SKILL.md)). A
+   different GPU, model, quantization or engine version counts as not measured.
+4. Check claims about code against the source of the installed version.
+
+| Question | Read |
+|---|---|
+| Where does a decode step's time go? | [results/step-anatomy.md](qwen3.8-27b/results/step-anatomy.md) |
+| Was X tried, and what happened? | [results/README.md](qwen3.8-27b/results/README.md), dead ends included |
+| Why does a patch exist, and what must stay when porting it? | the patch's card in its version folder |
+| Does a patch transfer to my GPU or model? | [port skill](skills/port-to-your-hardware/SKILL.md) §2, [05-ampere-sm86](skills/engine-internals/references/05-ampere-sm86.md) |
+| What does this layer, flag or backend do here? | [engine-internals](skills/engine-internals/SKILL.md) index, then its reference |
+| Is my number comparable to yours? | [measurement](skills/measurement/SKILL.md) rules, [traps](skills/measurement/references/traps.md) |
+
+Answers that memory gets wrong on this stack, all measured:
+
+- "Triton can use fp8 KV on a 3090." Triton 3.7.1 could not compile fp8e4nv loads or
+  stores on sm86; E003 decodes the bytes in software.
+- "A faster kernel makes the step faster." E006a's kernel passed its unit test, yet
+  torch.compile fixed the branch at trace time and the compiled graph never called it
+  (E008); E006c moved the branch into a custom op.
+- "nsys shows where the time goes." Node-level tracing stretched a step from 27.6 to
+  35.7 ms (vLLM 0.28.0) and the graph launch call from 58 to 954 µs (vLLM 0.33.0).
+- "Custom all-reduce runs on four GPUs." vLLM disables it on more than two PCIe-only GPUs.
+- "Speculative decoding always helps." Four prose streams on vLLM 0.33.0 ran 168.5 tok/s
+  with DFlash2 and 240.8 tok/s without (E006).
 
 ## Repo map
 

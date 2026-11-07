@@ -35,6 +35,10 @@ Your agent will first tell you in a few lines what the repo is, how it fits your
 machine and what it plans, and start after you agree. The dense knowledge lives in
 `AGENTS.md` and `skills/`; this page is the summary.
 
+Questions about this stack reach down to kernels and the GPU features they run on, where
+general knowledge is often wrong. Your agent answers from the measurements here and
+says when something was not measured.
+
 ## Scope
 
 One model on one rig. The patches make no attempt at generality; other GPUs and models
