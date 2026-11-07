@@ -31,7 +31,9 @@ This repo is meant to be operated by a coding agent. Point yours at
 
 > Read AGENTS.md and port this to my machine.
 
-The dense knowledge lives in `AGENTS.md` and `skills/`; this page is the summary.
+Your agent will first tell you in a few lines what the repo is, how it fits your
+machine and what it plans, and start after you agree. The dense knowledge lives in
+`AGENTS.md` and `skills/`; this page is the summary.
 
 ## Scope
 

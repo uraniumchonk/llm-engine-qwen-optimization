@@ -28,19 +28,32 @@ start-log readings), LMCache L2 bytes −43% with E014. Whole-stack benchmark ta
 
 Follow these on every route.
 
-1. Work on a copy. Apply patches to a separate venv or a copy of `site-packages`, never to
+1. Brief your human first. Before you change anything, tell the person you work for in a
+   few plain lines: what this repo is and the one setup it was made for, how their
+   setup compares, which route you plan and why, what you will touch, and what you need
+   from them (GPU time, permission to stop a server). Ask which route they want when
+   their request does not say. Start after they agree. Example:
+
+   > This repo has vLLM and LMCache patches made for one setup: Qwen3.8-27B with a
+   > DFlash2 drafter on 2× RTX 3090. There they cut the decode step from 27.1–27.5 ms to
+   > 19.7–19.9 ms. You run Qwen3.8-27B on one RTX 4090, so the patches will not apply as
+   > is. I plan the port route: inventory your setup, decide per patch, and measure your
+   > baseline. I will work in a separate venv and leave your running server alone. I need
+   > about an hour of GPU time with the server stopped. Go ahead?
+
+2. Work on a copy. Apply patches to a separate venv or a copy of `site-packages`, never to
    the `site-packages` a running production server imports. Move a patch set to
    production only after its numeric check passes, with a backup and a rollback path.
-2. Stop and report on CONFLICT. Leave the `.patch` files and the target files as they
+3. Stop and report on CONFLICT. Leave the `.patch` files and the target files as they
    are. A raised fuzz factor or a hand edit that forces a patch in is not a fix. Porting
    to another engine version is a new version folder, made with the optimization-method
    skill.
-3. Report "not checked" when `check-upstream.sh` cannot reach GitHub. Only a run whose
+4. Report "not checked" when `check-upstream.sh` cannot reach GitHub. Only a run whose
    every line reads OK counts as checked.
-4. Keep patch ids and measured numbers as written. A correction is a new dated line next
+5. Keep patch ids and measured numbers as written. A correction is a new dated line next
    to the old number; an id is never reused.
-5. Ask the operator before stopping, restarting or reconfiguring a production server.
-6. End with a report:
+6. Ask the operator before stopping, restarting or reconfiguring a production server.
+7. End with a report:
    - the version folder, its upstream tag, and the installed versions;
    - the `apply.sh --check` output, and the `check-upstream.sh` result or "not checked";
    - per patch, the start-log line found, or "missing";
@@ -111,7 +124,7 @@ scripts/check-upstream.sh qwen3.8-27b/vllm/v0.33.0                          # ev
   files first, because later patches build on earlier ones (E006c edits lines E006a
   adds). CLEAN: the series applies in order, and apply mode then patches the tree.
   APPLIED: the tree already holds the whole series. CONFLICT: the first failing patch is
-  named and the tree is unchanged; stop and report (guardrail 2).
+  named and the tree is unchanged; stop and report (guardrail 3).
 - After applying, set the switches from the model README's patch table and confirm each
   patch from the log line its card names. Steps, backup and rollback:
   [skills/apply-patch-set](skills/apply-patch-set/SKILL.md).
