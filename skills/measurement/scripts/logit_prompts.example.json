@@ -1,0 +1,8 @@
+{
+  "zh_prose": "Write a short passage of about three hundred characters in Traditional Chinese describing a harbor at dawn and fishing boats heading out.",
+  "zh_tech": "Explain in Traditional Chinese what the KV cache does in large language model inference and why long contexts use so much GPU memory.",
+  "code": "Write a Python function that parses an nginx access log line into a dict, with type hints and a docstring.",
+  "en": "Explain in plain English how a hash map handles collisions, with one short example.",
+  "mixed": "Compare the concurrency models of Rust and Go, answering in Traditional Chinese, and give a short code example for each.",
+  "list": "List twelve practical tips for keeping a home server reliable, one line each."
+}

@@ -19,7 +19,8 @@ E003 applies to plain v0.28.0 as well as on top of them (checked 2026-11-07).
   `vllm/v1/attention/ops/triton_unified_attention.py`.
 - Problem, change, what to keep and failure signs: same as the
   [0.33.0 card](../v0.33.0/README.md#e003-triton-fp8-e4m3-kv-on-pre-sm89-gpus).
-- Measured (2026-11-03, GPU A/B): decode step 27.6–31.0 → 22.5–23.0 ms, KV pool 369,545
+- Measured (2026-11-03, GPU A/B): greedy decode step 27.60–31.01 → 22.50–22.75 ms (first JIT repetition left out; the
+  card first read 22.5–23.0, which held production-sampling runs; corrected 2026-11-07), KV pool 369,545
   tokens in both, greedy outputs 6/6 identical. The baseline ran the drafter on FlashInfer.
 - Written by: Claude, with a hardening pass by Codex (NaN bytes 0x7F/0xFF decode to NaN
   instead of ±480; `tl.static_assert` rejects an fp8 query).

@@ -1,0 +1,6 @@
+{
+  "numeric": "Count upward from 1 in Arabic numerals, separating the numbers with a comma and a space. Do not stop and do not write anything else.",
+  "code": "Write a complete LRU cache class in Python (doubly linked list + dict) with get/put/delete/resize, type hints, docstrings and pytest tests. Output only the code.",
+  "prose": "Write a long essay in Traditional Chinese about an autumn evening walk through a city, describing the streets, the smells, the light and the crowds, at least one thousand characters.",
+  "mixed": "Explain the TCP three-way handshake and four-way teardown in Traditional Chinese. Give each step a short Python socket example with an explanation, and end with a comparison table."
+}

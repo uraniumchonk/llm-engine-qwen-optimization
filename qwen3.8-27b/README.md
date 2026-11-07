@@ -3,6 +3,10 @@
 vLLM and LMCache patches for Qwen3.8-27B, a hybrid Gated DeltaNet (GDN) model, served
 with a DFlash2 speculative drafter. In our production since 2026-11-04.
 
+Agents start at [AGENTS.md](../AGENTS.md). Every experiment behind these patches:
+[results](results/README.md); where a decode step's time goes:
+[step-anatomy](results/step-anatomy.md).
+
 ## Scope: one model, one rig
 
 These patches are designed for this one model on this one machine and make no attempt
@@ -34,9 +38,9 @@ enough detail to port it yourself.
 
 | Patch | What it does | Switch | Measured on our rig |
 |---|---|---|---|
-| E003 | Triton attention reads fp8 e4m3 KV on pre-SM89 GPUs (software decode), so the drafter can leave FlashInfer and its per-step CPU sync | `VLLM_TRITON_FP8_SW_DEQUANT=1` | decode step 27.1–27.9 → 21.8–22.3 ms (0.33) |
+| E003 | Triton attention reads fp8 e4m3 KV on pre-SM89 GPUs (software decode), so the drafter can leave FlashInfer and its per-step CPU sync | `VLLM_TRITON_FP8_SW_DEQUANT=1` | decode step 27.10–27.47 → 21.77–22.10 ms (0.33, greedy) |
 | E005 | Forces the hybrid KV cache group size instead of taking the smallest layer count (5 drafter layers) | `VLLM_KV_GROUP_SIZE=16` | KV pool 396,364 → 488,000 tokens (+23.1%) |
-| E006a/b/c | Small-M split-K Triton GEMM for GDN `in_proj_ba` during spec decode, dispatched at run time; GDN spec path uses views instead of copies | on when applied; `VLLM_E006_SMALL_M=0` turns E006a/c off | decode step 21.15–21.4 → 19.74–19.91 ms |
+| E006a/b/c | Small-M split-K Triton GEMM for GDN `in_proj_ba` during spec decode, dispatched at run time; GDN spec path uses views instead of copies | on when applied; `VLLM_E006_SMALL_M=0` turns E006a/c off | decode step 21.15–21.40 → 19.74–19.91 ms |
 | E014 | LMCache stores GDN and drafter state only at checkpoint chunks; attention KV is stored for every chunk | `LMCACHE_MEOW_CKPT_K=4` | L2 bytes −43% on our workload |
 
 With the switch unset, E003, E005 and E014 leave upstream behaviour unchanged.

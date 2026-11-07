@@ -20,17 +20,20 @@ Single-request decode step time, greedy, 300 tokens, LMCache off (2026-11-03/04)
 
 | Setup | ms per step | KV pool tokens |
 |---|---|---|
-| 0.33.0 unpatched | 27.1–27.9 | 394,971 |
-| + E003 | 21.8–22.3 | 396,364 |
+| 0.33.0 unpatched | 27.10–27.47 | 394,971 |
+| + E003 | 21.77–22.10 | 396,364 |
 | + E003 + E005 | 21.0–21.3 | 488,000 |
 | + E003 + E005 + E006a/b/c with `VLLM_E006_SMALL_M=0` | 21.15–21.4 | 488,000 |
 | + E003 + E005 + E006a/b/c | 19.74–19.91 | 488,000 |
 | 0.33.0 without speculative decoding, for reference | 14.23–14.31 | 633,831 |
 
 Each speculative step verifies up to 7 drafted tokens, so tokens per second depends on the
-acceptance rate. Single-stream decode with all patches and LMCache on, against the same
-model on vLLM 0.28.0 with upstream backports (measured 2026-09-11): code 265 → 375,
-prose 74 → 103, mixed 97 → 137, agent job 159 → 224 tok/s (2026-11-04).
+acceptance rate. Tokens per second by prompt type, before and after:
+[vllm-hybrid-mamba-notes](https://github.com/uraniumchonk/vllm-hybrid-mamba-notes).
+Every experiment behind these rows: [results](../../results/README.md).
+
+Correction 2026-11-07: the unpatched and + E003 rows first read 27.1–27.9 and 21.8–22.3 ms;
+those ranges also held production-sampling runs. The greedy runs are above (run record E004).
 
 ---
 
@@ -63,7 +66,7 @@ prose 74 → 103, mixed 97 → 137, agent job 159 → 224 tok/s (2026-11-04).
 - Measured: kernel test on 2026-11-03: written bytes equal torch's fp8 cast bit for bit;
   attention output vs a bf16 reference differs by at most 2.4e-4 (causal) and 7.8e-3
   (non-causal), from tile size 32 vs 16 accumulation order; all 256 encodings decode equal
-  to independent arithmetic. GPU A/B on 0.33.0: decode step 27.1–27.9 → 21.8–22.3 ms,
+  to independent arithmetic. GPU A/B on 0.33.0, greedy: decode step 27.10–27.47 → 21.77–22.10 ms,
   greedy outputs 6/6 identical.
 - Written by: Claude (0.28.0 version), hardened by Codex; ported to 0.33.0 by Codex.
 - Upstream status (2026-11-07): we found no upstream PR doing this.
@@ -89,7 +92,7 @@ prose 74 → 103, mixed 97 → 137, agent job 159 → 224 tok/s (2026-11-04).
   integer`; a divisibility ValueError. Setting 5 also fails (48 and 16 are not multiples of
   5), so an A/B baseline leaves the variable unset.
 - Measured (2026-11-03, E003 on in both): KV pool 396,364 → 488,000 tokens (+23.1%),
-  decode step 21.8–22.3 → 21.0–21.3 ms, greedy outputs 6/6 identical.
+  decode step 21.77–22.10 → 21.03–21.30 ms, greedy outputs 6/6 identical.
 - Written by: Codex.
 - Upstream status (2026-11-07): the vLLM hybrid KV cache manager design doc says the
   grouping heuristic will be revisited when a model gives a bad result; we found no
