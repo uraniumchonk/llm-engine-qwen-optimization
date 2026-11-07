@@ -6,6 +6,8 @@
 # from raw.githubusercontent.com at that tag into a temporary directory, applies `series`
 # there with scripts/apply.sh, then applies each test-only/*.patch on top. Nothing outside
 # the temporary directory changes.
+# Needs network access to raw.githubusercontent.com. A fetch that fails for any reason
+# other than HTTP 404 prints NOT CHECKED and exits 3: report the series as not checked.
 set -u
 DIR=$(cd "${1:?version dir}" && pwd) || exit 2
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -21,9 +23,12 @@ echo "== $repo@$tag"
 # shellcheck disable=SC2086
 for f in $(grep -h '^+++ b/' $patches $tests | sed 's#^+++ b/##' | sort -u); do
   mkdir -p "$TMP/tree/$(dirname "$f")"
-  if ! curl -fsL "https://raw.githubusercontent.com/$repo/$tag/$f" -o "$TMP/tree/$f"; then
-    rm -f "$TMP/tree/$f"; echo "   (not in $tag, the patch creates it: $f)"
-  fi
+  code=$(curl -sL -o "$TMP/tree/$f" -w '%{http_code}' "https://raw.githubusercontent.com/$repo/$tag/$f") || code=000
+  case "$code" in
+    200) ;;
+    404) rm -f "$TMP/tree/$f"; echo "   (not in $tag, the patch creates it: $f)" ;;
+    *) echo "NOT CHECKED: fetching $f returned HTTP $code (no network or GitHub unreachable)"; exit 3 ;;
+  esac
 done
 
 "$HERE/apply.sh" "$DIR" "$TMP/tree" || exit 1

@@ -74,9 +74,10 @@ Loop back from step 2 or 3 with the next largest item. Our order of gains is the
   E008 then showed the compiled graph never called it.
 - Treat another agent's summary as a lead: read the raw lines it cites before you quote
   it.
-- Port to a new engine version by reading the patch's card, re-applying with zero fuzz,
-  and re-measuring; carried-over numbers stay labelled with the version they were
-  measured on.
+- Port to a new engine version in a new version folder: read the patch's card, write
+  the patch against the new tag's untouched files, apply it with zero fuzz, and
+  re-measure. The old folder's patches and numbers stay as they are; carried-over
+  numbers stay labelled with the version they were measured on.
 
 ## Records
 

@@ -24,8 +24,9 @@ The design choices follow from that setup:
   N = 48, K = 5120), and E006b changes only the Qwen GDN path.
 - E014 assumes GDN groups, one attention group and one drafter sliding window.
 
-We test no other model, drafter, GPU, quantization or parallel size. Other setups are
-out of scope, including requests to support them. The cards describe each change in
+We test no other model, drafter, GPU, quantization or parallel size, and we do not
+support them. To port, use the [port skill](../skills/port-to-your-hardware/SKILL.md): it
+gives the method and the constants to re-derive, and the cards describe each change in
 enough detail to port it yourself.
 
 ## Index

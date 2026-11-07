@@ -6,19 +6,47 @@ one Qwen model at a time, plus the method we used to make and measure them.
 
 - It is a small, specialized project and an index, not a fork. Each patch set is made for
   one model on one rig and makes no attempt at generality. Other models, GPUs,
-  quantizations or parallel sizes are not tested, and supporting them is out of scope.
+  quantizations or parallel sizes are untested and we do not support them. Porting to
+  them is your own work: the port route below gives the method and the constants to
+  re-derive.
 - Patches are kept per model, per engine, per engine version. A patch is a `git diff`
   against the untouched files of an upstream release tag.
 
-| Model | Folder | Engines | Status |
-|---|---|---|---|
-| Qwen3.8-27B (48 GDN + 16 attention layers), AWQ-INT4, DFlash2 drafter, 2× RTX 3090, TP2 | [qwen3.8-27b](qwen3.8-27b/README.md) | vLLM 0.33.0, 0.28.0; LMCache 0.5.6 | in our production since 2026-11-04 |
+| Model | Folder | Engine version | Patches | Status |
+|---|---|---|---|---|
+| Qwen3.8-27B (48 GDN + 16 attention layers), AWQ-INT4, DFlash2 drafter, 2× RTX 3090, TP2 | [qwen3.8-27b](qwen3.8-27b/README.md) | vLLM 0.33.0 | E003, E005, E006a/b/c | in our production since 2026-11-04 |
+| | | LMCache 0.5.6 | E014 (+ kv_probe, test only) | in our production since 2026-11-04, with vLLM 0.33.0 |
+| | | vLLM 0.28.0 | E003 | A/B tested 2026-11-03; superseded by 0.33.0 |
 
 What the Qwen3.8-27B set did on our rig (one request, greedy; details in
 [results](qwen3.8-27b/results/README.md)): decode step 27.10–27.47 ms on unpatched vLLM
-0.33.0 → 19.74–19.91 ms with the series, KV pool 394,971 → 488,000 tokens, LMCache L2 bytes
-−43% with E014. Whole-stack benchmark tables live in
+0.33.0 → 19.74–19.91 ms with the series, KV pool 394,971 → 488,000 tokens (both exact
+start-log readings), LMCache L2 bytes −43% with E014. Whole-stack benchmark tables live in
 [vllm-hybrid-mamba-notes](https://github.com/uraniumchonk/vllm-hybrid-mamba-notes).
+
+## Guardrails
+
+Follow these on every route.
+
+1. Work on a copy. Apply patches to a separate venv or a copy of `site-packages`, never to
+   the `site-packages` a running production server imports. Move a patch set to
+   production only after its numeric check passes, with a backup and a rollback path.
+2. Stop and report on CONFLICT. Leave the `.patch` files and the target files as they
+   are. A raised fuzz factor or a hand edit that forces a patch in is not a fix. Porting
+   to another engine version is a new version folder, made with the optimization-method
+   skill.
+3. Report "not checked" when `check-upstream.sh` cannot reach GitHub. Only a run whose
+   every line reads OK counts as checked.
+4. Keep patch ids and measured numbers as written. A correction is a new dated line next
+   to the old number; an id is never reused.
+5. Ask the operator before stopping, restarting or reconfiguring a production server.
+6. End with a report:
+   - the version folder, its upstream tag, and the installed versions;
+   - the `apply.sh --check` output, and the `check-upstream.sh` result or "not checked";
+   - per patch, the start-log line found, or "missing";
+   - the numeric check per class: step-time range with n, greedy outputs identical k/N,
+     KL with its noise floor and token counts, `kv_probe` digests equal k/N;
+   - every environment variable and flag you set, and how to undo each.
 
 ## Routes
 
@@ -83,7 +111,7 @@ scripts/check-upstream.sh qwen3.8-27b/vllm/v0.33.0                          # ev
   files first, because later patches build on earlier ones (E006c edits lines E006a
   adds). CLEAN: the series applies in order, and apply mode then patches the tree.
   APPLIED: the tree already holds the whole series. CONFLICT: the first failing patch is
-  named and the tree is unchanged; fix it by hand against that patch's card.
+  named and the tree is unchanged; stop and report (guardrail 2).
 - After applying, set the switches from the model README's patch table and confirm each
   patch from the log line its card names. Steps, backup and rollback:
   [skills/apply-patch-set](skills/apply-patch-set/SKILL.md).
@@ -135,9 +163,11 @@ Card template:
 - Signs it is off or broken:
 - Measured (date, setup):
 - Upstream status:
+- Written by:
 ```
 
-Name who wrote a patch only the way the existing cards do.
+`Written by` names who wrote the patch and who hardened or ported it, for example
+"Codex; hardened by Claude".
 
 ## Writing rules for this repo
 
@@ -153,9 +183,20 @@ Every file here is read by other agents; write facts only.
   sentences; the second needs its own run.
 - Documents describe what the code does as checked against the code or a run.
 - Keep superseded numbers and add a dated correction next to them.
-- One direction per sentence, in positive form.
+- One direction per sentence, in positive form. Write "On CONFLICT, stop and report."
+  rather than "Don't fix a CONFLICT yourself, unless the change looks small."
 - Leave out local paths, host names, private service ports and account details.
 
+## Requirements
+
+- bash 4 or newer and GNU patch 2.7 or newer for `apply.sh` (tested with bash 5.2 and
+  patch 2.7.6).
+- curl and network access to raw.githubusercontent.com for `check-upstream.sh`.
+- Python 3 for the measurement scripts (tested with 3.12.3); `step_probe.py` needs
+  `httpx`, `logit_diff.py` uses the standard library only.
+- A vLLM or LMCache install at the exact version of the folder you apply.
+
 License: Apache-2.0, the license of vLLM and LMCache; the original code keeps its
-authors' copyright. Patches were written with AI coding agents and reviewed, tested and
+authors' copyright. The notes repo (vllm-hybrid-mamba-notes) is MIT and holds numbers and
+links; patch code stays here under Apache-2.0. Patches were written with AI coding agents and reviewed, tested and
 measured by us; each card names who wrote it.

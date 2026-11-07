@@ -23,14 +23,20 @@ the repo root.
 - LMCache 0.5.6 under torch 2.14: the PyPI wheel's CUDA extension fails to import and
   LMCache falls back to plain torch copies. Build 0.5.6 from the PyPI sdist against your
   torch first, then apply the patches to that install (error text in the LMCache card).
-- `scripts/check-upstream.sh <version folder>` (needs curl) fetches the tag's files and
-  checks the series against them; every line must read OK.
+- `scripts/check-upstream.sh <version folder>` (needs curl and network access to
+  raw.githubusercontent.com) fetches the tag's files and checks the series against them;
+  every line must read OK. `NOT CHECKED` (exit 3) or no network: report the series as
+  not checked.
 
 ## 2. Back up, check, apply
 
+Apply to a separate venv or a copy of `site-packages` first, never to the one a running
+production server imports. Production gets the patch set after step 5 passes, with the
+operator's go-ahead.
+
 ```bash
 V=qwen3.8-27b/vllm/v0.33.0
-ROOT=/path/to/site-packages          # the directory that contains vllm/
+ROOT=/path/to/test-venv/site-packages   # the directory that contains vllm/
 
 # back up every existing file the series touches (new files have no backup)
 (cd "$V" && grep -h '^+++ b/' $(grep -v -E '^(#|$)' series) | sed 's#^+++ b/##' | sort -u) \
@@ -44,8 +50,10 @@ scripts/apply.sh "$V" "$ROOT"           # applies the whole series with zero fuz
 - `apply.sh` (needs GNU patch) first runs the whole series on a scratch copy and
   touches the tree only when every patch applies with zero fuzz.
 - CLEAN: apply. APPLIED: the tree already holds the series. CONFLICT: the first failing
-  patch is named and the tree is unchanged; read that patch's card and port it by hand.
-  Do not raise the fuzz factor.
+  patch is named and the tree is unchanged. Stop and report the output. Leave the
+  `.patch` files and the target files as they are; a raised fuzz factor or a hand edit
+  that forces a patch in is not a fix. A different engine version needs its own version
+  folder ([optimization-method](../optimization-method/SKILL.md)).
 - The patched source triggers a recompile: vLLM 0.33's compile cache keys on source. Give
   the patched engine its own `VLLM_CACHE_ROOT` if you keep an unpatched one for A/B.
 - E005 changes the KV layout. Point LMCache at a fresh L2 directory before the first
@@ -127,3 +135,14 @@ scripts/apply.sh "$V" "$ROOT" --check   # must now report CLEAN
   group size 16 belong to the other layout. Use the L2 directory that matches the layout
   you run.
 - Compile cache: unpatched source compiles again (or reuses the unpatched cache root).
+
+## 7. Report
+
+End with:
+
+- the version folder, its upstream tag, and the installed engine versions;
+- the `apply.sh --check` output, and the `check-upstream.sh` result or "not checked";
+- per patch, the start-log line found (section 4), or "missing";
+- the numeric check per class (section 5): step-time range with n, greedy outputs
+  identical k/N, KL with its noise floor and token counts, `kv_probe` digests equal k/N;
+- every environment variable and flag you set, and how to undo each (section 6).

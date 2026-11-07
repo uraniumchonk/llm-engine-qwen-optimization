@@ -11,8 +11,9 @@
 # patches build on earlier ones (E006c edits lines E006a adds). Outcomes:
 #   CLEAN     the series applies in order; apply mode then applies it to the tree
 #   APPLIED   the tree already holds the whole series; nothing to do
-#   CONFLICT  the series does not apply; the first failing patch is named, the tree is
-#             unchanged. Fix it by hand against that patch's card in the folder's README.md.
+#   CONFLICT  the series does not apply; the first failing patch is named and the tree is
+#             unchanged. Stop and report it. Leave the .patch files as they are; raising the
+#             fuzz factor or editing code to force a patch in is not a fix.
 set -u
 DIR=$(cd "${1:?version dir}" && pwd) || exit 2
 ROOT=$(cd "${2:?tree root}" && pwd) || exit 2
@@ -55,7 +56,7 @@ fi
 
 case "$state" in
   APPLIED) echo "APPLIED  the tree already holds all ${#SERIES[@]} patches of $DIR"; exit 0 ;;
-  CONFLICT) echo "CONFLICT $failed does not apply, and the tree does not hold the whole series either (a partly patched tree lands here too). Tree unchanged; see the card in $DIR/README.md"; exit 1 ;;
+  CONFLICT) echo "CONFLICT $failed does not apply, and the tree does not hold the whole series either (a partly patched tree lands here too). Tree unchanged. Stop and report this output; leave the .patch files as they are."; exit 1 ;;
 esac
 if [ "$MODE" = --check ]; then
   echo "CLEAN    all ${#SERIES[@]} patches apply in order: ${SERIES[*]}"; exit 0

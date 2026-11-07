@@ -35,8 +35,9 @@ The dense knowledge lives in `AGENTS.md` and `skills/`; this page is the summary
 
 ## Scope
 
-One model on one rig. The patches make no attempt at generality, and other setups are
-out of scope. The [model README](qwen3.8-27b/README.md) says exactly what they were made
-for; further Qwen models get their own folder.
+One model on one rig. The patches make no attempt at generality; other GPUs and models
+are untested and we do not support them. The port skill gives an agent the method and
+the constants to re-derive. The [model README](qwen3.8-27b/README.md) says exactly what
+the patches were made for; further Qwen models get their own folder.
 
 Apache-2.0, the license of vLLM and LMCache.
