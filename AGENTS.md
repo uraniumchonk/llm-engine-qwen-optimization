@@ -111,7 +111,7 @@ Tools and the eight measurement rules: [skills/measurement](skills/measurement/S
 
 1. A new model gets `<model>/README.md` with its scope and test rig (copy the layout of
    [qwen3.8-27b/README.md](qwen3.8-27b/README.md)) and a row in the model table of this
-   file and of the root README.
+   file.
 2. A new engine version gets `<model>/<engine>/v<X.Y.Z>/` with `UPSTREAM`, `series` and
    the patch files. Make each patch as a `git diff` against the untouched upstream files
    of that tag, one patch per change.
