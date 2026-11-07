@@ -2,7 +2,7 @@
 
 Upstream: `vllm-project/vllm` tag `v0.33.0`. Apply order: [`series`](series).
 In our production since 2026-11-04 together with [LMCache 0.5.6 + E014](../../lmcache/v0.5.6/README.md).
-Rig and flags: [root README](../../README.md#test-rig).
+Rig and flags: [model README](../../README.md#test-rig).
 Scope: written for Qwen3.8-27B (48 GDN + 16 attention layers) with the DFlash2 drafter on
 2× RTX 3090 only; no attempt at generality. See [Scope](../../README.md#scope-one-model-one-rig).
 

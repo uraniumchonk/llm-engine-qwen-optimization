@@ -2,7 +2,7 @@
 
 Upstream: `vllm-project/vllm` tag `v0.28.0`. Apply order: [`series`](series).
 Tested on 2026-11-03; we moved to [vLLM 0.33.0](../v0.33.0/README.md) the next day, where
-this patch has a port and E005/E006 join it. Rig: [root README](../../README.md#test-rig).
+this patch has a port and E005/E006 join it. Rig: [model README](../../README.md#test-rig).
 Scope: written for Qwen3.8-27B (48 GDN + 16 attention layers) with the DFlash2 drafter on
 2× RTX 3090 only; no attempt at generality. See [Scope](../../README.md#scope-one-model-one-rig).
 
