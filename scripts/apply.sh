@@ -15,9 +15,15 @@
 #             unchanged. Stop and report it. Leave the .patch files as they are; raising the
 #             fuzz factor or editing code to force a patch in is not a fix.
 set -u
+USAGE="usage: scripts/apply.sh <version dir> <tree root> [--check]"
+[ $# -le 3 ] || { echo "too many arguments; $USAGE"; exit 2; }
+case "${3:-}" in
+  "") MODE=apply ;;
+  --check) MODE=--check ;;
+  *) echo "unknown argument: $3; nothing was changed; $USAGE"; exit 2 ;;
+esac
 DIR=$(cd "${1:?version dir}" && pwd) || exit 2
 ROOT=$(cd "${2:?tree root}" && pwd) || exit 2
-MODE=${3:-apply}
 command -v patch >/dev/null || { echo "needs GNU patch"; exit 2; }
 [ -f "$DIR/series" ] || { echo "no series file in $DIR"; exit 2; }
 
