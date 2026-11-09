@@ -27,7 +27,8 @@ hs=512`, drafter `nh=4 hs=256`. 0.5.6 cannot combine blend mode with
 ### E014 Checkpoint-only store of GDN and drafter chunks
 
 - Switch: `LMCACHE_MEOW_CKPT_K=<K>` in the vLLM process environment (we use 4). Unset or 0
-  stores every chunk, as upstream.
+  stores every chunk, as upstream. Role detection still runs in `__init__` with the switch
+  unset (corrected 2026-11-09).
 - Files: new `lmcache/integration/vllm/meow_checkpoint.py` (role detection from vLLM's
   `kv_cache_groups`, the set of chunks to keep, block id rewrite);
   `lmcache/integration/vllm/lmcache_mp_connector.py` (reads the switch and the roles in
@@ -46,7 +47,19 @@ hs=512`, drafter `nh=4 hs=256`. 0.5.6 cannot combine blend mode with
   it GDN and attention share one object, the attention ids keep that object live, and the
   null id is read as block 0, which is wrong data. All GDN engine groups are nulled
   together, because the server drops an object-group chunk only when every kernel group in
-  it is null. On any exception the patch logs one warning and stores every chunk.
+  it is null.
+- Not checked at start: K is set in the vLLM process and `--separate-object-groups` on the
+  LMCache server, and neither side reads the other. The only sign is the info log line
+  below. Confirm the server flag yourself before setting K. This includes blend mode,
+  which cannot use `--separate-object-groups` on 0.5.6 (2026-11-09).
+- Exceptions (corrected 2026-11-09): an exception while rewriting block ids on a store
+  (`_apply_meow_checkpoint`) logs one warning and stores every chunk. Exceptions in
+  `__init__` propagate and stop the connector from starting: an invalid
+  `LMCACHE_MEOW_CKPT_K`, or a drafter group with more than one sliding window, which is
+  checked even with the switch unset.
+- Unused code: `store_block_ids_for_tracker` and the two helpers only it calls
+  (`_storable_tokens`, `_slice_group`), about 108 lines in `meow_checkpoint.py`, have no
+  caller in the patch or in `test-only/` (2026-11-09).
 - Signs it is off or broken: the vLLM log must show
   `LMCACHE_MEOW_CKPT_K=4 roles=['gdn', 'gdn', 'gdn', 'attention', 'drafter']` (our model with
   vLLM E005 at group size 16). Roles all `attention` means role detection failed; it then

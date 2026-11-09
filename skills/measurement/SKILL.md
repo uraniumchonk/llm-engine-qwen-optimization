@@ -1,6 +1,6 @@
 ---
 name: measurement
-description: Load before you time a decode step, compare two builds or switches, or validate a patch numerically on vLLM with speculative decoding. Holds our eight measurement rules (step time, ITL, KV pool, greedy vs production sampling, repetitions, profiler effects, validation by patch class, logit KL against a noise floor), the A/B procedure, the traps that moved our numbers, and two scripts - step_probe.py (step time from /metrics) and logit_diff.py (relative logit comparison).
+description: Load before you time a decode step, compare two builds or switches, or validate a patch numerically on vLLM with speculative decoding. Holds our eight measurement rules (step time, ITL, KV pool, greedy vs production sampling, repetitions, profiler effects, validation by patch class, logit KL against a noise floor), the A/B procedure, the traps that moved our numbers, and three scripts - step_probe.py (step time from /metrics), logit_diff.py (relative logit comparison) and typev2_bench.py (six-type workload suite).
 ---
 
 # Measurement
@@ -44,7 +44,8 @@ do not. Write each result as a measured sentence: what, setup, n, date, range.
 8. **Statistical standard for target-math changes.** We do not require identical tokens.
    Run `logit_diff.py gen` (greedy, top-20 logprobs per generated token) on both builds and
    `gcmp` (compares up to the first generated-token divergence). Compare the patch's KL
-   with the same build's floor: one extra concurrent request gave KL 1.72e-4 and mean
+   with both reference levels: one extra concurrent request on the same build gave KL
+   1.72e-4 and mean
    |Δlogprob| 3.37e-3 (2026-11-04). A different tree with a fresh compile cache, same code
    path, gave 4.48e-4; the patches we adopted measured 4.11e-4 to 4.64e-4. The prefill
    `dump`/`cmp` mode does not reach kernels that only run at small M.
@@ -74,9 +75,9 @@ do not. Write each result as a measured sentence: what, setup, n, date, range.
 
 ## Scripts
 
-Both take the server root as `--base-url http://HOST:PORT` and the served model name as
-`--model`; neither has a default host, port or model. `step_probe.py` needs `httpx`;
-`logit_diff.py` uses only the Python standard library.
+All three take the server root as `--base-url http://HOST:PORT` and the served model name
+as `--model`; none has a default host, port or model. `step_probe.py` needs `httpx`;
+`logit_diff.py` and `typev2_bench.py` use only the Python standard library.
 
 ```bash
 # step time, greedy, one request, 2 repetitions per type
@@ -104,6 +105,9 @@ python3 scripts/logit_diff.py gcmp base.json base_busy.json
   originals, written in Chinese; the prose, mixed and two of the logit prompts ask for
   Traditional Chinese output. Acceptance rates and token-level results with these files
   differ from ours.
+- `typev2_bench.py` runs the six-type suite behind our tok/s tables. Its four synthetic
+  prompts are the originals; realjob and chitchat need a corpus built from your own records
+  ([typev2-method](references/typev2-method.md)).
 
 ## References
 
@@ -111,6 +115,9 @@ python3 scripts/logit_diff.py gcmp base.json base_busy.json
   with the size of the change.
 - [references/validation.md](references/validation.md): the three validation methods in
   detail (greedy identity, logit KL, bitwise KV checksums) and the values we saw.
+- [references/typev2-method.md](references/typev2-method.md): the six-type suite behind
+  our tok/s tables: type definitions, how to build a corpus from your own records, run
+  parameters, what each type can and cannot show, report format, what to keep private.
 - Where the step's time goes: [step-anatomy.md](../../qwen3.8-27b/results/step-anatomy.md).
 - Profiler behaviour per layer: [engine-internals](../engine-internals/SKILL.md),
   references 01 and 06.

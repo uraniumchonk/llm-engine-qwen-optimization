@@ -39,6 +39,13 @@ Pick the method by what the patch touches (rule 7 in [../SKILL.md](../SKILL.md))
 | Triton GDN decode kernel (E017) | 733 | 0.9932 | 4.54e-4 |
 | low verify width K=1 (E021, open) | 864 | 0.9942 | 7.38e-4 |
 
+- Reading the table: the adopted patches are 2.4–2.7× the one-extra-request floor and about
+  equal to the other-tree pair. That pair is one measurement of 505 tokens.
+- `gcmp` reports the mean over positions. The maximum per position is not in this table.
+- Engine upgrade from vLLM 0.28.0 to 0.33.0: no KL was recorded; greedy text was 2/6
+  identical (E004). The 0.28.0 stack has typev2 speed runs and a corruption soak (360/360
+  agent turns clean with LMCache retrieve on, 2026-08-28) in the notes repo. We found no
+  output-quality comparison between the two versions (checked 2026-11-09).
 - Prefill teacher forcing (`dump`/`cmp`) runs large M only. For E006c it showed bitwise
   identical logits at 6,639 positions while the decode path moved: use `gen`/`gcmp` for
   anything that runs at decode batch sizes.

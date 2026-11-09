@@ -9,8 +9,12 @@ them, written for coding agents to repeat on yours.
 
 Qwen3.8-27B with a DFlash2 drafter, vLLM + LMCache, 2× RTX 3090:
 
-- Decode step **27.6 → 19.3 ms**.
-- Single-stream decode **+39–42% tok/s** over our previous vLLM 0.28.0 stack.
+- Decode step on vLLM 0.33.0, patches alone: **27.10–27.47 → 19.74–19.91 ms**. With the
+  CPU governor and PCIe IPC all-reduce as well: 19.28–19.42 ms. Our earlier vLLM 0.28.0
+  stack: 27.6–31.0 ms.
+- Decode tok/s per stream over that 0.28.0 stack, [typev2 suite](skills/measurement/references/typev2-method.md),
+  0.33.0 side one run: **+39–42%** at one stream; at four streams +6–21% for five of the
+  six types and +56% for chitchat.
 - KV cache **+23%** (396,364 → 488,000 tokens).
 - LMCache disk use **−43%** by storing recurrent state only at checkpoints.
 

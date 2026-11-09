@@ -162,7 +162,7 @@ scripts/check-upstream.sh               apply one version folder to the upstream
 <model>/results/step-anatomy.md         where one decode step's time goes
 skills/<name>/SKILL.md                  agent skills (frontmatter name + description: when to load)
 skills/<name>/references/               details a skill points to
-skills/measurement/scripts/             step_probe.py, logit_diff.py, example prompt files
+skills/measurement/scripts/             step_probe.py, logit_diff.py, typev2_bench.py, example prompt files
 ```
 
 Patch ids (E003, E014, ...) are our experiment numbers, unique across the repo. A patch
@@ -189,8 +189,9 @@ scripts/check-upstream.sh qwen3.8-27b/vllm/v0.33.0                          # ev
 - After applying, set the switches from the model README's patch table and confirm each
   patch from the log line its card names. Steps, backup and rollback:
   [skills/apply-patch-set](skills/apply-patch-set/SKILL.md).
-- With a switch unset, E003, E005 and E014 run upstream code. E006a/b/c are on when
-  applied; `VLLM_E006_SMALL_M=0` turns E006a/c off.
+- With a switch unset, E003, E005 and E014 run upstream code, except that E014 still runs
+  role detection at connector start ([card](qwen3.8-27b/lmcache/v0.5.6/README.md)).
+  E006a/b/c are on when applied; `VLLM_E006_SMALL_M=0` turns E006a/c off.
 
 ## How patches are checked
 
@@ -199,10 +200,17 @@ scripts/check-upstream.sh qwen3.8-27b/vllm/v0.33.0                          # ev
   the patched files equal the ones our production engine runs.
 - Drafter-only and KV-layout changes: greedy outputs compared with the unpatched engine,
   reported as k/N identical, with acceptance listed separately.
-- Changes to the target model's math (kernels, all-reduce, engine versions): decode-logit
-  KL over the top-20 tokens against the unpatched path, judged against the same build's
-  run-to-run KL under one concurrent request as the noise floor. We do not expect
-  bit-identical tokens across builds or kernels.
+- Changes to the target model's math (kernels, all-reduce): decode-logit KL over the
+  top-20 tokens against the unpatched path, written next to two reference levels measured
+  on vLLM 0.33.0 (2026-11-04): 1.72e-4 (same build, one extra concurrent request, 1,363
+  tokens) and 4.48e-4 (same code path, other tree, fresh compile cache; one pair, 505
+  tokens). The patches we adopted measured 4.11e-4 to 4.64e-4: 2.4–2.7× the first level
+  and about equal to the second. We do not expect bit-identical tokens across builds or
+  kernels.
+- Engine upgrade from vLLM 0.28.0 to 0.33.0: no KL was recorded; greedy text was 2/6
+  identical (E004). The 0.28.0 stack has typev2 speed runs and a corruption soak (360/360
+  agent turns clean with LMCache retrieve on, 2026-08-28) in the notes repo. We found no
+  output-quality comparison between the two versions (checked 2026-11-09).
 - KV cache store changes: GPU checksums of every chunk on store and retrieve, zero
   mismatches (for LMCache: `qwen3.8-27b/lmcache/v0.5.6/test-only/kv_probe.patch`).
 - A speed number without its correctness check does not make a patch adopted.
@@ -267,7 +275,7 @@ Every file here is read by other agents; write facts only.
   patch 2.7.6).
 - curl and network access to raw.githubusercontent.com for `check-upstream.sh`.
 - Python 3 for the measurement scripts (tested with 3.12.3); `step_probe.py` needs
-  `httpx`, `logit_diff.py` uses the standard library only.
+  `httpx`, `logit_diff.py` and `typev2_bench.py` use the standard library only.
 - A vLLM or LMCache install at the exact version of the folder you apply.
 
 License: Apache-2.0, the license of vLLM and LMCache; the original code keeps its
