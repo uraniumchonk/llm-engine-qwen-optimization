@@ -30,9 +30,10 @@ Follow these on every route.
 
 1. Brief your human first. Before you change anything, tell the person you work for in a
    few plain lines: what this repo is and the one setup it was made for, how their
-   setup compares, which route you plan and why, what you will touch, and what you need
-   from them (GPU time, permission to stop a server). Ask which route they want when
-   their request does not say. Start after they agree. Example:
+   setup compares, which route you plan and why, what you will touch, what to back up
+   first (guardrail 2), and what you need from them (GPU time, permission to stop a
+   server). Ask which route they want when their request does not say. Start after they
+   agree. Example:
 
    > This repo has vLLM and LMCache patches made for one setup: Qwen3.8-27B with a
    > DFlash2 drafter on 2× RTX 3090. There they cut the decode step from 27.1–27.5 ms to
@@ -44,6 +45,10 @@ Follow these on every route.
 2. Work on a copy. Apply patches to a separate venv or a copy of `site-packages`, never to
    the `site-packages` a running production server imports. Move a patch set to
    production only after its numeric check passes, with a backup and a rollback path.
+   Before that move, tell your human what a full snapshot covers and let them decide
+   whether to take one: the whole venv (a self-built LMCache included), the start command
+   and environment variables, and the driver and kernel state. `pre-patch-backup.tgz`
+   from apply-patch-set holds only the files the series touches.
 3. Stop and report on CONFLICT. Leave the `.patch` files and the target files as they
    are. A raised fuzz factor or a hand edit that forces a patch in is not a fix. Porting
    to another engine version is a new version folder, made with the optimization-method

@@ -130,7 +130,9 @@ rm -f "$ROOT/vllm/model_executor/layers/mamba/gdn/small_m_bf16_gemm.py"
 scripts/apply.sh "$V" "$ROOT" --check   # must now report CLEAN
 ```
 
-- Or reinstall the package at the same version.
+- Or reinstall at the same version: vLLM from its PyPI wheel; LMCache 0.5.6 under torch
+  2.14 by rebuilding from the PyPI sdist against your torch (section 1), because its wheel
+  falls back to plain torch copies there. Then confirm the LMCache build line in section 4.
 - KV layout: after E005 is off, the KV layout is upstream's again; L2 objects written with
   group size 16 belong to the other layout. Use the L2 directory that matches the layout
   you run.

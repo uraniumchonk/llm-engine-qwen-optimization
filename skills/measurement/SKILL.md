@@ -58,9 +58,10 @@ do not. Write each result as a measured sentence: what, setup, n, date, range.
 2. Before each run read the load average and the CPU governor. Other CPU jobs on the
    machine made our step 19.9 → 22.5 ms; governor `performance` vs `schedutil` moved
    it 19.75–19.93 → 19.58–19.71 ms.
-3. Stop the production server if the GPUs are shared, restart the KV-cache server, start
-   the test instance with its own compile cache root (`VLLM_CACHE_ROOT`) per variant,
-   wait for health 200.
+3. Stop the production server if the GPUs are shared, restart the KV-cache server, save
+   the list of GPU process PIDs (the `nvidia-smi` query in step 6), start the test
+   instance with its own compile cache root (`VLLM_CACHE_ROOT`) per variant, wait for
+   health 200.
 4. Read the start log: KV pool, the patch's confirmation line, the attention and
    all-reduce backends, the CUDA graph mode. A missing confirmation line means the run
    measures something else.
@@ -68,9 +69,11 @@ do not. Write each result as a measured sentence: what, setup, n, date, range.
    instance.
 6. Stop the instance and check for orphan workers: after the main process exits, a
    spawned worker can keep its GPU memory. List GPU processes by PID
-   (`nvidia-smi --query-compute-apps=pid,used_memory --format=csv,noheader`) and kill
-   what is left. Restart the KV-cache server, then bring production back and confirm its
-   health and KV pool.
+   (`nvidia-smi --query-compute-apps=pid,used_memory --format=csv,noheader`). Kill only
+   the PIDs this test instance started: those absent from the list saved in step 3, other
+   than the KV-cache server. Report every other PID to your human and leave it running.
+   Restart the KV-cache server, then bring production back and confirm its health and KV
+   pool.
 7. Write the run record (fields: [optimization-method](../optimization-method/SKILL.md)).
 
 ## Scripts
