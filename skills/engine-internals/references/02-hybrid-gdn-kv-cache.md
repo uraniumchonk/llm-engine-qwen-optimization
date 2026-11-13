@@ -75,6 +75,36 @@ rule sat in `v1/core/kv_cache_utils.py:1211` in 0.28):
 - E014 keeps `ceil(window / 1600)` = 2 drafter chunks up to each checkpoint, which covers
   the 2048-token window that ends at that chunk boundary.
 
+## Fine-grained prefix hits and shared pages (E031)
+
+- `--prefix-match-unit 64` hashes the prompt in 64-token units so a hit can end inside a
+  1600-token block. 0.33 turns this off unless every prefix-cacheable group's manager
+  supports fine-grained lookup; the DFlash drafter's `SlidingWindowManager` does not, and
+  the start log prints `Disabling fine-grained prefix-cache hits ... SlidingWindowManager`.
+  Hits then stay on the block grid: an agent turn recomputes 0–1,600 tokens depending on
+  where the previous prompt ended (TTFT cycled about 200–900 ms on our rig).
+- Without FlashInfer's GDN prefill checkpoints (SM90/SM10x/SM12x only; SM86 runs the
+  Triton/FLA kernel) the scheduler splits the prefill at the prompt's last 64-token
+  boundary (`tail_boundary`) and caches the GDN state there. That costs one extra forward
+  step per prompt. With DFlash no EAGLE block is dropped, so the tail key and the GDN tail
+  state sit at floor((P−1)/64)×64.
+- A hit that ends mid-block shares a block the new request will write into, so vLLM
+  copies it first (copy-on-write: `_apply_cow`, then `copy_kv_cache_blocks_inplace` in the
+  worker).
+- Pitfall we hit: `copy_kv_cache_blocks_inplace` skipped a per-layer tensor whose start
+  address it had seen. With the E005 grouping, the GDN state view and the attention or
+  drafter KV view of one layer slot share an allocation and start at the same address. The
+  GDN view was copied through its own layout (a small part of each page) and the KV view
+  was skipped, so the resumed request read KV that was partly zero (about 496K bytes per
+  copied block). What it looked like: greedy output diverged within 4–17 tokens, KL
+  against a full recompute was 13× the concurrency noise floor, an fp32 SSM cache did not
+  change it, and block-aligned hits stayed bitwise exact. Fix in patch E031: de-duplicate
+  by address, shape, stride and dtype. Whether stock grouping or other models hit the same
+  path is not checked.
+- Conversations that rewrite earlier messages fork before the previous prompt's tail,
+  where no GDN state exists; they fall back to the block grid. The gain is for turns that
+  extend or keep the previous prompt (fixed system prompt and tools: p50 796 → 230 ms).
+
 ## KV pool sizes we measured
 
 From the start log line `GPU KV cache size: N tokens`; fp8 KV, `--max-model-len` 256k,

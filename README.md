@@ -9,6 +9,13 @@ them, written for coding agents to repeat on yours.
 
 Qwen3.8-27B with a DFlash2 drafter, vLLM + LMCache, 2× RTX 3090:
 
+- Agent-loop TTFT: prefix-cache hits land on a **64-token grid** instead of the KV block.
+  vLLM runs hybrid GDN/Mamba models with large KV blocks (several hundred to a few
+  thousand tokens; 1,600 here) and stock prefix hits stop at a block boundary, so every
+  agent turn recomputes up to a whole block and TTFT cycles with where the previous prompt
+  ended. With E031, 29.5K-token turns that keep the system prompt and tools: **TTFT p50
+  796 → 230 ms, p90 1,247 → 538 ms**. It needed a fix to vLLM's copy-on-write of shared
+  hybrid pages; before it, mid-block hits read partly zeroed KV.
 - Decode step on vLLM 0.33.0, patches alone: **27.10–27.47 → 19.74–19.91 ms**. With the
   CPU governor and PCIe IPC all-reduce as well: 19.28–19.42 ms. Our earlier vLLM 0.28.0
   stack: 27.6–31.0 ms.

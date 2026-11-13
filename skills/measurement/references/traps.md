@@ -37,6 +37,14 @@ Each entry: what happened, how large it was, what to do. Experiment ids point to
   instance did not start. Restart the KV-cache server between instances.
 - Issue stop and start of services as separate commands. One combined stop and start
   command of ours ended with exit 144 (cause not found) although the services came up.
+  2026-11-13 (E031): exit 144 came back on a background command whose own text held
+  `pkill -f "port 5207"`; it ended before its launch step. Kill by the PID that owns the
+  port (`ss -ltnp`) from a separate command.
+- A watchdog started as `nohup setsid bash -c "sleep N; ..." &` leaves `$!` pointing at
+  `setsid`, which exits at once; `kill $!` does not stop the waiting child. One such
+  watchdog, meant as a safety net that restores production after a test, fired later in
+  the middle of the next test and restarted production (E031). Find the child by its
+  command text with `ps -eo pid,args`, or have the child write its own PID to a file.
 
 ## Compile cache
 

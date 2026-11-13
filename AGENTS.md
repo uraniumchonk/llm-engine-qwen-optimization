@@ -14,14 +14,16 @@ one Qwen model at a time, plus the method we used to make and measure them.
 
 | Model | Folder | Engine version | Patches | Status |
 |---|---|---|---|---|
-| Qwen3.8-27B (48 GDN + 16 attention layers), AWQ-INT4, DFlash2 drafter, 2× RTX 3090, TP2 | [qwen3.8-27b](qwen3.8-27b/README.md) | vLLM 0.33.0 | E003, E005, E006a/b/c | in our production since 2026-11-04 |
-| | | LMCache 0.5.6 | E014 (+ kv_probe, test only) | in our production since 2026-11-04, with vLLM 0.33.0 |
+| Qwen3.8-27B (48 GDN + 16 attention layers), AWQ-INT4, DFlash2 drafter, 2× RTX 3090, TP2 | [qwen3.8-27b](qwen3.8-27b/README.md) | vLLM 0.33.0 | E003, E005, E006a/b/c, E031 | in our production since 2026-11-04 (E031 since 2026-11-13) |
+| | | LMCache 0.5.6 | E014, E030 (+ kv_probe, test only) | in our production since 2026-11-04, with vLLM 0.33.0 (E030 since 2026-11-13) |
 | | | vLLM 0.28.0 | E003 | A/B tested 2026-11-03; superseded by 0.33.0 |
 
 What the Qwen3.8-27B set did on our rig (one request, greedy; details in
 [results](qwen3.8-27b/results/README.md)): decode step 27.10–27.47 ms on unpatched vLLM
 0.33.0 → 19.74–19.91 ms with the series, KV pool 394,971 → 488,000 tokens (both exact
-start-log readings), LMCache L2 bytes −43% with E014. Whole-stack benchmark tables live in
+start-log readings), LMCache L2 bytes −43% with E014; prefix hits on a 64-token grid
+with E031 (agent turns with a fixed system prompt and tools, 29.5K tokens: TTFT p50 796 →
+230 ms). Whole-stack benchmark tables live in
 [vllm-hybrid-mamba-notes](https://github.com/uraniumchonk/vllm-hybrid-mamba-notes).
 
 ## Guardrails

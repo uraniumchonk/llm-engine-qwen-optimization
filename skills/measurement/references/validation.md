@@ -52,6 +52,30 @@ Pick the method by what the patch touches (rule 7 in [../SKILL.md](../SKILL.md))
 - This is a relative check, not an absolute KLD against a higher-precision reference
   model.
 
+## Exact resume test (prefix-cache hit paths)
+
+- A hit compared with a full recompute only gives a statistical answer, because the two
+  runs split the prompt into different chunks. To get a yes/no answer, send the same token
+  prompt twice under one `cache_salt` (`/v1/completions` with token ids, greedy, top-20
+  logprobs). The second send resumes from the state the first one cached and computes the
+  same last chunk with the same shapes, so a correct resume is bitwise identical. Choose
+  prompt lengths that put the resume point mid-block and one on a block boundary as the
+  control.
+- Mixed case: store a long prompt, reset the GPU prefix cache (`/reset_prefix_cache`
+  answers `success: true` even when it failed; the server log says `Failed to reset prefix
+  cache because some blocks (N) are not freed yet`, so wait and repeat), send a shorter
+  prefix, then the long prompt again: a mid-block GPU hit extended by external KV chunks,
+  compared with a fresh recompute under a new salt.
+- After block copies, compare every per-layer tensor of each copied pair byte for byte
+  (patch E031, `VLLM_E031_DEBUG=1`). That located the E031 bug in one run.
+- Discriminators that did not separate cause from noise: an fp32 SSM cache (the KL
+  stayed, so state rounding was ruled out but nothing was located), and a recompute with
+  a different chunk split (it moves fewer tokens than a hit does).
+- E031 numbers (29.5K-token agent prompts, 48 greedy tokens): recompute twice 7/7
+  identical, KL 0; recompute alone vs with one concurrent request 3/7 identical, KL
+  9.4e-4; 64-token hits before the fix 2/9, KL 1.2e-2; after the fix 7/7, KL 6.7e-4; exact
+  resume after the fix bitwise identical at three mid-block positions.
+
 ## Bitwise KV checksums (KV store and retrieve)
 
 - Patch the LMCache server with `qwen3.8-27b/lmcache/v0.5.6/test-only/kv_probe.patch`

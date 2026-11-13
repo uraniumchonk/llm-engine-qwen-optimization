@@ -1,7 +1,7 @@
 # vLLM 0.33.0
 
 Upstream: `vllm-project/vllm` tag `v0.33.0`. Apply order: [`series`](series).
-In our production since 2026-11-04 together with [LMCache 0.5.6 + E014](../../lmcache/v0.5.6/README.md).
+In our production since 2026-11-04 (E031 since 2026-11-13) together with [LMCache 0.5.6 + E014](../../lmcache/v0.5.6/README.md).
 Rig and flags: [model README](../../README.md#test-rig).
 Scope: written for Qwen3.8-27B (48 GDN + 16 attention layers) with the DFlash2 drafter on
 2× RTX 3090 only; no attempt at generality. See [Scope](../../README.md#scope-one-model-one-rig).
@@ -13,6 +13,7 @@ Scope: written for Qwen3.8-27B (48 GDN + 16 attention layers) with the DFlash2 d
 | E006a | on when applied (`VLLM_E006_SMALL_M=0` off, with E006c) | new `model_executor/layers/mamba/gdn/small_m_bf16_gemm.py`, `model_executor/layers/linear.py`, `model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py` |
 | E006b | on when applied | `model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py`, `third_party/flash_linear_attention/ops/fused_sigmoid_gating.py` |
 | E006c | `VLLM_E006_SMALL_M=0` turns E006a/c off | `model_executor/layers/mamba/gdn/small_m_bf16_gemm.py`, `linear.py`, `qwen_gdn_linear_attn.py` |
+| E031 | `VLLM_E031_SWA_FINE_HITS=1` plus `--prefix-match-unit 64` | `v1/core/single_type_kv_cache_manager.py`, `v1/worker/utils.py`, `v1/worker/mamba_utils.py` (debug log) |
 
 Paths are under `vllm/`.
 
@@ -180,5 +181,7 @@ those ranges also held production-sampling runs. The greedy runs are above (run 
   (second send resumes mid-block) is bitwise identical; a mid-block GPU hit extended by LMCache
   chunks is bitwise identical to a fresh recompute; 64-grid hits vs recompute KL 6.7e-4 against
   a 9.4e-4 concurrency noise floor; drafter acceptance 0.242 vs 0.241.
+- In our production since 2026-11-13 (live check: a prompt extended by a few words hit at
+  11,456 and 8,704 tokens, both mid-block on the 64-token grid).
 - Written by: Claude (host).
 
