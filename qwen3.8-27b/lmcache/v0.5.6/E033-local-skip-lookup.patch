@@ -1,0 +1,362 @@
+diff --git a/lmcache/integration/vllm/lmcache_mp_connector.py b/lmcache/integration/vllm/lmcache_mp_connector.py
+index dbdfbf7..5f104c6 100644
+--- a/lmcache/integration/vllm/lmcache_mp_connector.py
++++ b/lmcache/integration/vllm/lmcache_mp_connector.py
+@@ -4,6 +4,7 @@
+ from collections.abc import Iterable
+ from typing import TYPE_CHECKING, Any
+ import math
++import os
+ import sys
+ import time
+ 
+@@ -137,6 +138,11 @@ if TYPE_CHECKING:
+ 
+ logger = lmcache_init_logger(__name__)
+ 
++# E033: with LMCACHE_MEOW_LOCAL_SKIP=1 the lookup carries the vLLM local prefix
++# hit, and an LMCache server with the same switch does not load or lock the
++# chunks below it (they still count toward the hit).
++_MEOW_LOCAL_SKIP = os.environ.get("LMCACHE_MEOW_LOCAL_SKIP") == "1"
++
+ _DCP_LAYOUT_NAMESPACE = "##lmcache-dcp-layout-v1-"
+ _MAX_LCM_EXPANSION_FACTOR = 4
+ 
+@@ -1321,6 +1327,8 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
+             cache_salt=tracker.cache_salt,
+             request_configs=tracker.request_configs,
+             reserve_last_token=self._reserve_last_token_for_lookup,
++            # E033: chunks below the local prefix hit are not loaded or locked
++            local_hit_tokens=num_computed_tokens if _MEOW_LOCAL_SKIP else 0,
+         )
+ 
+         ret = self.scheduler_adapter.check_lookup_result(request.request_id)
+diff --git a/lmcache/integration/vllm/vllm_multi_process_adapter.py b/lmcache/integration/vllm/vllm_multi_process_adapter.py
+index 64d3e00..309ad81 100644
+--- a/lmcache/integration/vllm/vllm_multi_process_adapter.py
++++ b/lmcache/integration/vllm/vllm_multi_process_adapter.py
+@@ -64,6 +64,9 @@ if TYPE_CHECKING:
+ 
+ logger = init_logger(__name__)
+ 
++# E033b: scheduler-side wait budget for a lookup result (milliseconds; 0 = off).
++_MEOW_LOOKUP_WAIT_S = max(0.0, float(os.environ.get("LMCACHE_MEOW_LOOKUP_WAIT_MS", "0") or 0)) / 1000.0
++
+ # Export through vLLM's multiprocess Prometheus registry, independently of drains.
+ _KV_EVENTS_BUFFERED = Gauge(
+     "vllm:lmcache_mp_kv_events_buffered",
+@@ -850,6 +853,7 @@ class LMCacheMPSchedulerAdapter:
+         cache_salt: str = "",
+         request_configs: dict[str, Any] | None = None,
+         reserve_last_token: bool = False,
++        local_hit_tokens: int = 0,
+     ) -> None:
+         """
+         Submit a new lookup request to LMCache if there is no ongoing request.
+@@ -868,6 +872,10 @@ class LMCacheMPSchedulerAdapter:
+                 the IPC key.
+             reserve_last_token: Whether to exclude the final token before
+                 aligning the lookup range.
++            local_hit_tokens: E033. Tokens vLLM already holds in its own KV
++                cache; sent as request_configs["meow.local_hit_tokens"] so a
++                server with LMCACHE_MEOW_LOCAL_SKIP=1 does not load or lock the
++                chunks below it. 0 sends nothing.
+ 
+         Returns:
+             None
+@@ -893,6 +901,9 @@ class LMCacheMPSchedulerAdapter:
+             lookup_tokens // self.lmcache_tokens_per_chunk
+         ) * self.lmcache_tokens_per_chunk
+ 
++        if local_hit_tokens > 0:
++            request_configs = dict(request_configs or {})
++            request_configs["meow.local_hit_tokens"] = int(local_hit_tokens)
+         key = self._create_key(
+             token_ids,
+             start=0,
+@@ -956,6 +967,33 @@ class LMCacheMPSchedulerAdapter:
+ 
+     @_lmcache_nvtx_annotate
+     def check_lookup_result(self, request_id: str) -> int | None:
++        """E033b: with LMCACHE_MEOW_LOOKUP_WAIT_MS > 0, keep polling for up to
++        that many milliseconds (waiting on the outstanding ack or status reply
++        between polls) so a lookup that the server answers at once is admitted
++        in this scheduler step instead of two steps later. 0 (default) polls
++        once, as upstream.
++        """
++        if _MEOW_LOOKUP_WAIT_S <= 0:
++            return self._check_lookup_result_once(request_id)
++        deadline = time.monotonic() + _MEOW_LOOKUP_WAIT_S
++        while True:
++            result = self._check_lookup_result_once(request_id)
++            remaining = deadline - time.monotonic()
++            if result is not None or remaining <= 0:
++                return result
++            ack = self._unacked_lookups.get(request_id)
++            pending = (
++                list(ack.futures.values())
++                if ack is not None
++                else [f for f, _ in self._lookup_status.get(request_id, {}).values()]
++            )
++            for fut in pending:
++                remaining = deadline - time.monotonic()
++                if remaining <= 0:
++                    break
++                fut.wait(timeout=remaining)
++
++    def _check_lookup_result_once(self, request_id: str) -> int | None:
+         """
+         Check the result of a previously submitted lookup request.
+ 
+diff --git a/lmcache/v1/distributed/api.py b/lmcache/v1/distributed/api.py
+index d261551..a521ba8 100644
+--- a/lmcache/v1/distributed/api.py
++++ b/lmcache/v1/distributed/api.py
+@@ -484,6 +484,9 @@ class PrefetchTaskSpec:
+             reader that will retrieve it. Ignored under ``NO_LOCK``.
+         fetching_policy: See :data:`FetchingPolicy`.
+         lock_mode: See :class:`PrefetchLockMode`.
++        skip_load_cols: E033. Leading chunks (columns) the caller already holds
++            in its own KV cache. They count as hits when L1 or L2 holds them,
++            and they are never loaded into L1 or kept locked. 0 = off.
+ 
+     Note:
+         Every key group holds the same number of keys (``group_size``). The
+@@ -495,6 +498,7 @@ class PrefetchTaskSpec:
+     num_kv_readers: int = 1
+     fetching_policy: FetchingPolicy = "prefix"
+     lock_mode: PrefetchLockMode = PrefetchLockMode.LOCK
++    skip_load_cols: int = 0
+ 
+     def __post_init__(self) -> None:
+         if not self.key_groups:
+diff --git a/lmcache/v1/distributed/storage_controllers/prefetch_controller.py b/lmcache/v1/distributed/storage_controllers/prefetch_controller.py
+index 1e54287..de9ad9c 100644
+--- a/lmcache/v1/distributed/storage_controllers/prefetch_controller.py
++++ b/lmcache/v1/distributed/storage_controllers/prefetch_controller.py
+@@ -309,9 +309,21 @@ def _build_request(
+         fetching_policy=spec.fetching_policy,
+         lock_mode=spec.lock_mode,
+         num_kv_readers=spec.num_kv_readers,
++        skip_load_cols=max(0, int(getattr(spec, "skip_load_cols", 0) or 0)),
+     )
+ 
+ 
++def _leading_cols_mask(num_rows: int, num_cols: int, n: int) -> Bitmap2D:
++    """E033: a grid with the first ``n`` columns of every row set."""
++    rows = []
++    for _ in range(num_rows):
++        row = Bitmap(num_cols)
++        for col in range(min(n, num_cols)):
++            row.set(col)
++        rows.append(row)
++    return Bitmap2D(rows)
++
++
+ # Class definitions
+ 
+ 
+@@ -367,6 +379,12 @@ class InFlightPrefetchRequest:
+     # Cells loaded from L2 so far, one row per key group; empty until the
+     # first load result is admitted.
+     l2_loaded_cells: Bitmap2D = field(default_factory=lambda: Bitmap2D([]))
++    # E033: leading columns the caller holds locally (PrefetchTaskSpec.
++    # skip_load_cols). After the first plan, ``local_found`` holds the planned
++    # cells of those columns; they count as found but hold no lock and are
++    # never loaded.
++    skip_load_cols: int = 0
++    local_found: "Bitmap2D | None" = None
+ 
+     # private fields
+     _flattened_keys: list[ObjectKey] = field(init=False, repr=False)
+@@ -1122,9 +1140,20 @@ class PrefetchController(StorageControllerInterface):
+             already returned.
+         """
+         states = request.key_states
++        local = request.local_found
++        l1_input = states.l1_locked_keys
++        if local is not None and self._l1_managers:
++            # E033: present the locally held cells as L1-resident so the plan
++            # keeps the hit prefix through them; they hold no lock.
++            l1_input = states.l1_locked_keys.copy()
++            first_l1 = min(self._l1_managers)
++            if first_l1 in l1_input:
++                l1_input[first_l1] = l1_input[first_l1] + local
++            else:
++                l1_input[first_l1] = local.copy()
+         load_plan = self._policy.plan_load(
+             key_groups=request.key_groups,
+-            l1_locked_keys=states.l1_locked_keys,
++            l1_locked_keys=l1_input,
+             l2_locked_keys=states.l2_locked_keys,
+             l1_manager_descs=self._l1_manager_descriptors,
+             l2_adapter_descs=active_l2_descs,
+@@ -1144,8 +1173,42 @@ class PrefetchController(StorageControllerInterface):
+ 
+         states.l1_locked_keys = load_plan.l1_planned_keys.copy()
+         states.l2_locked_keys = load_plan.l2_planned_keys.copy()
++        if local is not None:
++            planned = load_plan.l1_planned_keys.merge()
++            request.local_found = (
++                local & planned if len(planned) > 0 else local.zeros_like()
++            )
++            for l1_idx, grid in list(states.l1_locked_keys.items()):
++                states.l1_locked_keys[l1_idx] = grid - local
++        elif request.skip_load_cols > 0:
++            self._release_local_prefix(request)
+         return l2_dropped
+ 
++    def _release_local_prefix(self, request: InFlightPrefetchRequest) -> None:
++        """E033: turn the planned cells of the leading ``skip_load_cols``
++        columns into ``local_found``: return their L1 read locks and L2 locks
++        now, so they are neither loaded into L1 nor held."""
++        states = request.key_states
++        num_rows = len(request.key_groups)
++        num_cols = len(request.key_groups[0].keys)
++        mask = _leading_cols_mask(num_rows, num_cols, request.skip_load_cols)
++        local = Bitmap2D.zeros(num_rows, num_cols)
++        for l1_idx, grid in list(states.l1_locked_keys.items()):
++            cells = grid & mask
++            keys = _gather_keys(request.key_groups, cells)
++            if keys:
++                self._l1_managers[l1_idx].finish_read(keys, request.num_kv_readers)
++            states.l1_locked_keys[l1_idx] = grid - mask
++            local += cells
++        for l2_idx, grid in list(states.l2_locked_keys.items()):
++            cells = grid & mask
++            keys = _gather_keys(request.key_groups, cells)
++            if keys:
++                self._l2_adapters[l2_idx].submit_unlock(keys)
++            states.l2_locked_keys[l2_idx] = grid - mask
++            local += cells
++        request.local_found = local
++
+     def _poll_lookup_results(
+         self,
+         request: InFlightPrefetchRequest,
+@@ -1517,6 +1580,10 @@ class PrefetchController(StorageControllerInterface):
+             found = Bitmap2D.zeros(
+                 len(request.key_groups), len(request.key_groups[0].keys)
+             )
++        if request.local_found is not None:
++            # E033: locally held cells count as found; they hold no lock, so
++            # the release below (locked - hit) never touches them.
++            found = found + request.local_found
+ 
+         windows = [group.sliding_window_size for group in request.key_groups]
+         _hit_length, retain_rows = fold_unfold_grouped(found.to_list(), windows)
+diff --git a/lmcache/v1/multiprocess/modules/lmcache_driven_transfer.py b/lmcache/v1/multiprocess/modules/lmcache_driven_transfer.py
+index 88a04c0..3a47871 100644
+--- a/lmcache/v1/multiprocess/modules/lmcache_driven_transfer.py
++++ b/lmcache/v1/multiprocess/modules/lmcache_driven_transfer.py
+@@ -30,7 +30,10 @@ from lmcache.v1.multiprocess.custom_types import (
+ from lmcache.v1.multiprocess.engine_context import MPCacheServerContext
+ from lmcache.v1.multiprocess.engine_module import InstanceLivenessTarget
+ from lmcache.v1.multiprocess.group_view import EngineGroupInfo
+-from lmcache.v1.multiprocess.modules.lookup import resolve_prefetched_obj_keys
++from lmcache.v1.multiprocess.modules.lookup import (
++    meow_skip_chunks,
++    resolve_prefetched_obj_keys,
++)
+ from lmcache.v1.multiprocess.native_completion import (
+     DeviceHostFuncDispatcher,
+     submit_callback_to_stream,
+@@ -286,6 +289,7 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
+             hit_chunks,
+             locked_gids,
+             group_windows=group_windows,
++            skip_chunks=meow_skip_chunks(session),
+         )
+         if not session.claim_failed_retrieve_release(
+             instance_id, key, lookup_generation
+diff --git a/lmcache/v1/multiprocess/modules/lookup.py b/lmcache/v1/multiprocess/modules/lookup.py
+index f6d9256..04a348a 100644
+--- a/lmcache/v1/multiprocess/modules/lookup.py
++++ b/lmcache/v1/multiprocess/modules/lookup.py
+@@ -4,6 +4,7 @@
+ # Standard
+ from dataclasses import dataclass
+ from functools import partial
++import os
+ import threading
+ import time
+ 
+@@ -28,6 +29,19 @@ from lmcache.v1.multiprocess.token_hasher import TokenHasher
+ 
+ logger = init_logger(__name__)
+ 
++# E033: with LMCACHE_MEOW_LOCAL_SKIP=1 a lookup whose request_configs carries
++# "meow.local_hit_tokens" (the vLLM local prefix hit) does not load or lock the
++# chunks below that hit; they still count toward the hit length.
++_MEOW_LOCAL_SKIP = os.environ.get("LMCACHE_MEOW_LOCAL_SKIP") == "1"
++MEOW_LOCAL_HIT_KEY = "meow.local_hit_tokens"
++
++
++def meow_skip_chunks(session) -> int:
++    """E033: chunks of the current lookup that were not locked (0 when off)."""
++    if session is None:
++        return 0
++    return int(session.extras.get("meow_skip_chunks", 0) or 0)
++
+ 
+ def resolve_prefetched_obj_keys(
+     ctx: MPCacheServerContext,
+@@ -35,6 +49,7 @@ def resolve_prefetched_obj_keys(
+     hit_chunks: int,
+     locked_gids: tuple,
+     group_windows: tuple[int, ...] | None = None,
++    skip_chunks: int = 0,
+ ) -> list[ObjectKey]:
+     """Resolve the subset of a request range that lookup actually locked.
+ 
+@@ -64,12 +79,12 @@ def resolve_prefetched_obj_keys(
+         if hit_chunks < 0:
+             if window >= 0:
+                 continue
+-            lo, hi = start_chunk, end_chunk
++            lo, hi = max(start_chunk, skip_chunks), end_chunk
+         else:
+             # Locked range per ``unfold``: the whole hit prefix for full
+             # attention, its trailing ``window`` chunks otherwise.
+             lo = 0 if window < 0 else max(0, hit_chunks - window)
+-            lo = max(lo, start_chunk)
++            lo = max(lo, start_chunk, skip_chunks)
+             hi = min(hit_chunks, end_chunk)
+         if lo >= hi:
+             continue
+@@ -260,6 +275,14 @@ class LookupModule:
+         session = self._ctx.session_manager.get_or_create(key.request_id)
+         session.set_tokens(list(key.token_ids))
+         session.begin_lookup(key, tuple(attn_desc.num_chunks_in_sw))
++        skip_cols = 0
++        if _MEOW_LOCAL_SKIP and key.request_configs:
++            try:
++                local_tokens = int(key.request_configs.get(MEOW_LOCAL_HIT_KEY, 0) or 0)
++            except (TypeError, ValueError):
++                local_tokens = 0
++            skip_cols = min(len(chunk_hashes), max(0, local_tokens // self._ctx.chunk_size))
++        session.extras["meow_skip_chunks"] = skip_cols
+ 
+         group_layout_descs = self._ctx.layout_desc_registry.find_group_layout_descs(
+             model_name, world_size
+@@ -298,6 +321,7 @@ class LookupModule:
+                 attn_desc,
+             ),
+             num_kv_readers=num_kv_readers,
++            skip_load_cols=skip_cols,
+         )
+         handle = self._ctx.storage_manager.submit_prefetch_task(
+             spec,
+@@ -447,7 +471,11 @@ class LookupModule:
+         # CB prefix leg: its prefix set) -- releasing an unlocked group
+         # would drop another request's lock on the shared object key.
+         obj_keys = resolve_prefetched_obj_keys(
+-            self._ctx, key, hit_chunks, session.prefetch_locked_gids
++            self._ctx,
++            key,
++            hit_chunks,
++            session.prefetch_locked_gids,
++            skip_chunks=meow_skip_chunks(session),
+         )
+         if not obj_keys:
+             return

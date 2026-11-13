@@ -1,7 +1,7 @@
 # Qwen3.8-27B on 2× RTX 3090
 
 vLLM and LMCache patches for Qwen3.8-27B, a hybrid Gated DeltaNet (GDN) model, served
-with a DFlash2 speculative drafter. In our production since 2026-11-04 (E031 since 2026-11-13).
+with a DFlash2 speculative drafter. In our production since 2026-11-04 (E031 and E033 since 2026-11-13).
 
 Agents start at [AGENTS.md](../AGENTS.md). Every experiment behind these patches:
 [results](results/README.md); where a decode step's time goes:
@@ -37,7 +37,7 @@ enough detail to port it yourself.
 |---|---|---|---|
 | vLLM 0.33.0 | [`vllm/v0.33.0`](vllm/v0.33.0/README.md) | E003, E005, E006a, E006b, E006c, E031 | in our production since 2026-11-04 (E031 since 2026-11-13) |
 | vLLM 0.28.0 | [`vllm/v0.28.0`](vllm/v0.28.0/README.md) | E003 | A/B on 2026-11-03 |
-| LMCache 0.5.6 | [`lmcache/v0.5.6`](lmcache/v0.5.6/README.md) | E014, E030, plus kv_probe (test only) | in our production since 2026-11-04 (E030 since 2026-11-13) |
+| LMCache 0.5.6 | [`lmcache/v0.5.6`](lmcache/v0.5.6/README.md) | E014, E030, E033, plus kv_probe (test only) | in our production since 2026-11-04 (E030 and E033 since 2026-11-13) |
 
 | Patch | What it does | Switch | Measured on our rig |
 |---|---|---|---|
@@ -46,8 +46,9 @@ enough detail to port it yourself.
 | E006a/b/c | Small-M split-K Triton GEMM for GDN `in_proj_ba` during spec decode, dispatched at run time; GDN spec path uses views instead of copies | on when applied; `VLLM_E006_SMALL_M=0` turns E006a/c off | decode step 21.15–21.40 → 19.74–19.91 ms |
 | E031 | Prefix-cache hits on a 64-token grid inside the 1600-token block: the drafter's sliding-window group supports fine-grained lookup, and the copy-on-write block copy no longer skips the attention/drafter KV view that shares its start address with the GDN view | `VLLM_E031_SWA_FINE_HITS=1` plus `--prefix-match-unit 64` | agent turns with a fixed system prompt and tools (29.5K tokens): TTFT p50 796 → 230 ms, p90 1,247 → 538 ms; 64-grid hits vs recompute KL 6.7e-4 (concurrency noise floor 9.4e-4) |
 | E014 | LMCache stores GDN and drafter state only at checkpoint chunks; attention KV is stored for every chunk | `LMCACHE_MEOW_CKPT_K=4` | L2 bytes −43% on our workload |
+| E033 | LMCache lookups count the chunks vLLM already holds without loading or locking them, and vLLM waits a few ms for the lookup answer instead of two scheduler steps | `LMCACHE_MEOW_LOCAL_SKIP=1` (server and vLLM), `LMCACHE_MEOW_LOOKUP_WAIT_MS=5` (vLLM) | request after a 10K-token store 152 → 66 ms and 433 → 0 MB read; 4 parallel agent chains: logged lookup 396 → 31 ms, TTFT p90 5.5 → 4.1 s |
 
-With the switch unset, E003, E005, E014 and E031 leave upstream behaviour unchanged.
+With the switch unset, E003, E005, E014, E031 and E033 leave upstream behaviour unchanged.
 
 ## Test rig
 

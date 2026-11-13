@@ -10,6 +10,7 @@ Scope: written for Qwen3.8-27B (48 GDN + 16 attention layers) with the DFlash2 d
 |---|---|---|
 | E014 | `LMCACHE_MEOW_CKPT_K=<int>` in the vLLM process | new `lmcache/integration/vllm/meow_checkpoint.py`, `lmcache/integration/vllm/lmcache_mp_connector.py` |
 | E030 | `LMCACHE_MEOW_L2_SYNC=1` in the LMCache server | `lmcache/v1/distributed/l2_adapters/nixl_store_dynamic_l2_adapter.py` |
+| E033 | `LMCACHE_MEOW_LOCAL_SKIP=1` in the LMCache server and the vLLM process; `LMCACHE_MEOW_LOOKUP_WAIT_MS=<ms>` in the vLLM process | `lmcache/integration/vllm/lmcache_mp_connector.py`, `lmcache/integration/vllm/vllm_multi_process_adapter.py`, `lmcache/v1/distributed/api.py`, `lmcache/v1/distributed/storage_controllers/prefetch_controller.py`, `lmcache/v1/multiprocess/modules/lookup.py`, `lmcache/v1/multiprocess/modules/lmcache_driven_transfer.py` |
 | kv_probe (test only, `test-only/`) | `LMCACHE_MEOW_KV_PROBE=1` in the LMCache server | `lmcache/v1/multiprocess/modules/lmcache_driven_transfer.py` |
 
 Build note: the 0.5.6 PyPI wheel's `lmcache.cuda_ops` is built against torch 2.13. Under
@@ -125,6 +126,73 @@ hs=512`, drafter `nh=4 hs=256`. 0.5.6 cannot combine blend mode with
   file. Read-only scan of our live directory: 23,324 files, 0 unparsed, 0.16 s. In
   production since 2026-11-13: the start log indexed 23,324 files (556 GB) and the index
   count matched the files on disk.
+
+### E033 Do not load or lock the chunks vLLM already holds; do not wait two scheduler steps for a lookup
+
+- Switches: `LMCACHE_MEOW_LOCAL_SKIP=1` in both the LMCache server and the vLLM process
+  (local-skip); `LMCACHE_MEOW_LOOKUP_WAIT_MS=<ms>` in the vLLM process (lookup wait, we use 5).
+  Unset keeps upstream behaviour on both sides.
+- Files: `lmcache/integration/vllm/lmcache_mp_connector.py` (`get_num_new_matched_tokens`
+  passes the local hit); `lmcache/integration/vllm/vllm_multi_process_adapter.py`
+  (`maybe_submit_lookup_request(local_hit_tokens=)`, the `check_lookup_result` wait loop);
+  `lmcache/v1/distributed/api.py` (`PrefetchTaskSpec.skip_load_cols`);
+  `lmcache/v1/distributed/storage_controllers/prefetch_controller.py` (`_plan_load`,
+  `_release_local_prefix`, `_finish_request`); `lmcache/v1/multiprocess/modules/lookup.py`
+  (switch, `meow.local_hit_tokens`, `resolve_prefetched_obj_keys(skip_chunks=)`);
+  `lmcache/v1/multiprocess/modules/lmcache_driven_transfer.py` (failed-retrieve cleanup
+  passes `skip_chunks`).
+- Problem: vLLM does not schedule a new request until LMCache answers how many chunks it
+  holds. To answer, the server prefetches every hit chunk into L1 and read-locks it, however
+  much of the prefix vLLM already holds in its own KV cache. Two costs follow:
+  - With `--l2-store-policy skip_l1` a chunk that was just stored lives only in L2, so the
+    request after a store reads the whole prefix back from disk. On our rig a 10K-token
+    prefix meant 433 MB read and a one-step increment of 152-194 ms instead of 72-83 ms.
+    Over two days of live traffic vLLM logged 3,007 lookups with a weighted mean of
+    91.7 ms.
+  - `check_lookup_result` never blocks: the LOOKUP ack, the QUERY_PREFETCH_STATUS send and
+    its reply each take one scheduler pass, and the scheduler skips the request while the
+    result is unknown. Under load a new request waits two whole engine steps of other
+    requests. With 4 agent chains in parallel the logged lookup latency averaged 396 ms.
+- Change:
+  1. The vLLM connector puts the block-aligned local prefix hit the scheduler passes in
+     into `request_configs["meow.local_hit_tokens"]` of the lookup key. ObjectKeys do not
+     include `request_configs`, so no object key changes.
+  2. Server: `skip_load_cols` = local hit // chunk size. After the first load plan, the
+     planned cells of those columns become `local_found`: their L1 read locks and L2 locks
+     are returned at once, nothing is reserved in L1 or loaded from L2. Every later plan
+     sees them as L1-resident, and `_finish_request` counts them as found.
+     `resolve_prefetched_obj_keys` starts at the skipped chunk count, so
+     `free_lookup_locks` and failed-retrieve cleanup never return a lock that was not
+     taken.
+  3. Lookup wait: `check_lookup_result` repeats its pass for up to the budget, waiting on
+     the outstanding ack or status reply in between. An answer inside the budget admits
+     the request in the same scheduler step; otherwise it stays asynchronous as upstream.
+- Keep when porting: the server skips only for lookups that carry
+  `meow.local_hit_tokens` (other engines' connectors behave as before); skipped chunks never
+  exceed the looked-up chunks; vLLM retrieves from the chunk boundary of its local hit, so a
+  retrieve never touches a skipped chunk.
+- Signs: with the switch on and the prefix held by vLLM, the request after a store reads
+  nothing from disk and the server logs `Prefetch request completed ... (N L1, 0 L2)` in
+  about 1 ms; `GET /status` shows `read_locked_count` 0 at rest; no `Bypassing LMCache` or
+  load failures in the vLLM log.
+- Tested: an offline test that drives the real `PrefetchController` and
+  `DefaultPrefetchPolicy` with counting fake L1/L2 tiers (7 cases: hit length equal to the
+  upstream path in each pair, every L1 lock returned once or kept for retrieve, no L2 lock
+  returned twice). On the test instance: after a 10K-token store the next one-step request
+  took 65.8 ms and read 0 MB (upstream 151.9 ms, 433.4 MB). Full LMCache load (6,400 cached)
+  and local first half plus LMCache second half (16,000 cached, 18 objects read) gave 32
+  greedy tokens identical to a cold recompute in two rounds (KL 0). Four agent chains in
+  parallel, 25 turns each from empty caches, upstream / local-skip / local-skip + 5 ms wait:
+  logged lookup latency 396.2 / 371.6 / 30.7 ms, TTFT p50 1,300.7 / 1,293.5 / 1,221.8 ms,
+  p90 5,504.5 / 5,678.1 / 4,089.2 ms, objects loaded from L2 116 / 58 / 58, L1 use 13.5% /
+  6.7% / 6.7%, check turns 13/15 / 12/15 / 13/15 greedy-identical (mean KL 7.4e-4 /
+  8.0e-4 / 6.0e-4 against a 9.4e-4 same-prompt concurrency floor), no load failure and no
+  lock left. In production since 2026-11-13: live lookups 2.4-3.7 ms; the request after a
+  10K-token store took 64.5 ms with 0 MB read.
+- Upstream behaviour seen while testing (not changed here): for hybrid models the first
+  plan returns the locks of every earlier GDN and drafter cell, so when the L1 reservation
+  of the last chunk fails, the replan finds no GDN cell to end on and the hit drops to 0
+  instead of falling back to an earlier chunk.
 
 ### kv_probe (test only)
 

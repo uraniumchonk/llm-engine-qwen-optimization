@@ -15,7 +15,7 @@ one Qwen model at a time, plus the method we used to make and measure them.
 | Model | Folder | Engine version | Patches | Status |
 |---|---|---|---|---|
 | Qwen3.8-27B (48 GDN + 16 attention layers), AWQ-INT4, DFlash2 drafter, 2× RTX 3090, TP2 | [qwen3.8-27b](qwen3.8-27b/README.md) | vLLM 0.33.0 | E003, E005, E006a/b/c, E031 | in our production since 2026-11-04 (E031 since 2026-11-13) |
-| | | LMCache 0.5.6 | E014, E030 (+ kv_probe, test only) | in our production since 2026-11-04, with vLLM 0.33.0 (E030 since 2026-11-13) |
+| | | LMCache 0.5.6 | E014, E030, E033 (+ kv_probe, test only) | in our production since 2026-11-04, with vLLM 0.33.0 (E030 and E033 since 2026-11-13) |
 | | | vLLM 0.28.0 | E003 | A/B tested 2026-11-03; superseded by 0.33.0 |
 
 What the Qwen3.8-27B set did on our rig (one request, greedy; details in
