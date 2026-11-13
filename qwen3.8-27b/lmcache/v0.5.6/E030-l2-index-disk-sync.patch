@@ -1,0 +1,209 @@
+diff --git a/lmcache/v1/distributed/l2_adapters/nixl_store_dynamic_l2_adapter.py b/lmcache/v1/distributed/l2_adapters/nixl_store_dynamic_l2_adapter.py
+index eb9ac2c..fc7f900 100644
+--- a/lmcache/v1/distributed/l2_adapters/nixl_store_dynamic_l2_adapter.py
++++ b/lmcache/v1/distributed/l2_adapters/nixl_store_dynamic_l2_adapter.py
+@@ -26,6 +26,7 @@ from __future__ import annotations
+ # Standard
+ from typing import Optional
+ import asyncio
++import os
+ import threading
+ 
+ # First Party
+@@ -43,6 +44,7 @@ from lmcache.v1.distributed.l2_adapters.factory import (
+ )
+ from lmcache.v1.distributed.l2_adapters.nixl_store_agents.dynamic_nixl_store_agent import (  # noqa: E501
+     DynamicNixlStorageAgent,
++    _object_key_to_filename,
+ )
+ from lmcache.v1.distributed.l2_adapters.nixl_store_agents.file_dynamic_nixl_store_agent import (  # noqa: E501
+     FILE_DYNAMIC_BACKENDS,
+@@ -57,6 +59,37 @@ from lmcache.v1.platform import create_event_notifier
+ logger = init_logger(__name__)
+ 
+ 
++def _meow_filename_to_key(name: str) -> Optional[ObjectKey]:
++    """E030: reverse ``_object_key_to_filename`` (flat layout).
++
++    ``<model with / as -->_<kv_rank 08x>_<group x>_<hash hex>[@salt].bin``.
++    Returns None unless the key maps back to exactly ``name``.
++    """
++    if not name.endswith(".bin"):
++        return None
++    stem = name[: -len(".bin")]
++    salt = ""
++    if "@" in stem:
++        stem, salt = stem.rsplit("@", 1)
++    parts = stem.rsplit("_", 3)
++    if len(parts) != 4:
++        return None
++    model_s, rank_s, group_s, hash_s = parts
++    try:
++        key = ObjectKey(
++            chunk_hash=bytes.fromhex(hash_s),
++            model_name=model_s.replace("--", "/"),
++            kv_rank=int(rank_s, 16),
++            object_group_id=int(group_s, 16),
++            cache_salt=salt,
++        )
++    except ValueError:
++        return None
++    if _object_key_to_filename(key) != name:
++        return None
++    return key
++
++
+ def _create_dynamic_nixl_storage_agent(
+     device: str,
+     backend: str,
+@@ -145,6 +178,23 @@ class DynamicNixlStoreL2Adapter(L2AdapterInterface):
+ 
+         self._persist_enabled = config.persist_config.persist_enabled
+ 
++        # E030 (LMCACHE_MEOW_L2_SYNC=1; upstream behaviour when unset):
++        # keep the in-memory index in step with the files on disk.
++        # 1. At start, index every data file already in the directory, so its
++        #    bytes count toward capacity and the eviction policy can evict it
++        #    (upstream adopts a file only when a lookup happens to ask for it,
++        #    so files from before a restart are never counted or evicted).
++        # 2. A load that finds its file gone drops the key from the index, so
++        #    the next store writes it again (upstream keeps the key, reports it
++        #    present on every lookup and skips every later store of it).
++        self._meow_l2_sync = os.environ.get("LMCACHE_MEOW_L2_SYNC") == "1"
++        self._meow_rebuilt: list[tuple[ObjectKey, int]] = []
++        if self._meow_l2_sync:
++            try:
++                self._meow_rebuild_index_from_disk()
++            except Exception:
++                logger.exception("LMCACHE_MEOW_L2_SYNC: index rebuild failed")
++
+     # --------------------
+     # Event Fd Interface
+     # --------------------
+@@ -325,6 +375,98 @@ class DynamicNixlStoreL2Adapter(L2AdapterInterface):
+         self._lookup_efd.close()
+         self._load_efd.close()
+ 
++    #####################
++    # E030 index/disk sync (LMCACHE_MEOW_L2_SYNC=1)
++    #####################
++
++    def register_listener(self, listener) -> None:
++        """Register a listener; with E030 on, seed it with the keys indexed
++        from disk at start, oldest file first, one key per call so every
++        eviction policy sees them in file-age order."""
++        super().register_listener(listener)
++        if not self._meow_rebuilt:
++            return
++        try:
++            for key, size in self._meow_rebuilt:
++                listener.on_l2_keys_stored([key], [size])
++        except Exception as e:
++            logger.warning("LMCACHE_MEOW_L2_SYNC: listener seed failed: %s", e)
++
++    def _meow_rebuild_index_from_disk(self) -> None:
++        """Index the data files already in the (flat) storage directory."""
++        agent = self.nixl_agent
++        root = getattr(agent, "file_path", None)
++        if root is None or getattr(agent, "shard_dirs", False):
++            logger.warning(
++                "LMCACHE_MEOW_L2_SYNC: index rebuild supports the flat file "
++                "layout only; skipped"
++            )
++            return
++        found: list[tuple[float, ObjectKey, int]] = []
++        skipped = 0
++        with os.scandir(root) as it:
++            for entry in it:
++                if not entry.name.endswith(".bin"):
++                    continue
++                if not entry.is_file(follow_symlinks=False):
++                    continue
++                key = _meow_filename_to_key(entry.name)
++                if key is None:
++                    skipped += 1
++                    continue
++                st = entry.stat(follow_symlinks=False)
++                found.append((st.st_mtime, key, st.st_size))
++        found.sort(key=lambda t: t[0])
++        rebuilt: list[tuple[ObjectKey, int]] = []
++        with self._lock:
++            for _, key, size in found:
++                if key in self._memory_objects:
++                    continue
++                self._memory_objects[key] = NixlStoreObj(
++                    page_indices=[], size=size, layout=None
++                )
++                self._total_bytes += size
++                rebuilt.append((key, size))
++        by_salt: dict[str, int] = {}
++        total = 0
++        for key, size in rebuilt:
++            by_salt[key.cache_salt] = by_salt.get(key.cache_salt, 0) + size
++            total += size
++        with self._usage_lock:
++            self._total_bytes_used += total
++            for salt, d in by_salt.items():
++                self._bytes_by_cache_salt[salt] = (
++                    self._bytes_by_cache_salt.get(salt, 0) + d
++                )
++        self._meow_rebuilt = rebuilt
++        logger.info(
++            "LMCACHE_MEOW_L2_SYNC: indexed %d files (%d bytes) from %s; "
++            "%d .bin names not parsed",
++            len(rebuilt),
++            total,
++            root,
++            skipped,
++        )
++
++    def _meow_drop_missing(self, keys: list[ObjectKey]) -> None:
++        """Drop keys whose file is gone so a later store writes them again."""
++        dropped: list[ObjectKey] = []
++        sizes: list[int] = []
++        with self._lock:
++            for key in keys:
++                obj = self._memory_objects.pop(key, None)
++                if obj is None:
++                    continue
++                self._total_bytes -= obj.size
++                dropped.append(key)
++                sizes.append(obj.size)
++        if dropped:
++            logger.warning(
++                "LMCACHE_MEOW_L2_SYNC: dropped %d index entries whose file is gone",
++                len(dropped),
++            )
++            self._notify_keys_deleted(dropped, sizes)
++
+     ##################
+     # Helper functions
+     ##################
+@@ -534,6 +676,7 @@ class DynamicNixlStoreL2Adapter(L2AdapterInterface):
+         """
+         bitmap = Bitmap(len(keys))
+         accessed_keys: list[ObjectKey] = []
++        meow_gone: list[ObjectKey] = []
+         try:
+             # Read every present key's file concurrently (asyncio.gather
+             # below) so a multi-chunk request does not pay per-file NIXL
+@@ -571,6 +714,10 @@ class DynamicNixlStoreL2Adapter(L2AdapterInterface):
+                             keys[pos],
+                             result,
+                         )
++                        if self._meow_l2_sync and isinstance(
++                            result, FileNotFoundError
++                        ):
++                            meow_gone.append(keys[pos])
+                         continue
+                     bitmap.set(pos)
+                     accessed_keys.append(keys[pos])
+@@ -578,6 +725,8 @@ class DynamicNixlStoreL2Adapter(L2AdapterInterface):
+         except Exception:
+             logger.exception("Dynamic NIXL load task %d failed", task_id)
+ 
++        if meow_gone:
++            self._meow_drop_missing(meow_gone)
+         if accessed_keys:
+             self._notify_keys_accessed(accessed_keys)
+         with self._lock:

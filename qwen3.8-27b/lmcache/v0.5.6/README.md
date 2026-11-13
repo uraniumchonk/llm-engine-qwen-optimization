@@ -9,6 +9,7 @@ Scope: written for Qwen3.8-27B (48 GDN + 16 attention layers) with the DFlash2 d
 | Patch | Switch | Files |
 |---|---|---|
 | E014 | `LMCACHE_MEOW_CKPT_K=<int>` in the vLLM process | new `lmcache/integration/vllm/meow_checkpoint.py`, `lmcache/integration/vllm/lmcache_mp_connector.py` |
+| E030 | `LMCACHE_MEOW_L2_SYNC=1` in the LMCache server | `lmcache/v1/distributed/l2_adapters/nixl_store_dynamic_l2_adapter.py` |
 | kv_probe (test only, `test-only/`) | `LMCACHE_MEOW_KV_PROBE=1` in the LMCache server | `lmcache/v1/multiprocess/modules/lmcache_driven_transfer.py` |
 
 Build note: the 0.5.6 PyPI wheel's `lmcache.cuda_ops` is built against torch 2.13. Under
@@ -75,6 +76,54 @@ hs=512`, drafter `nh=4 hs=256`. 0.5.6 cannot combine blend mode with
   checkpoints. A vLLM RFC proposes application-declared prefix checkpoints for hybrid
   GDN/Mamba models on the engine side
   ([discuss.vllm.ai](https://discuss.vllm.ai/t/rfc-pr-stack-application-directed-prefix-checkpoints-for-hybrid-gdn-mamba-up-to-7-6x-speedup-on-l40s/2949)).
+
+### E030 Keep the nixl_store_dynamic L2 index in step with the files on disk
+
+- Switch: `LMCACHE_MEOW_L2_SYNC=1` in the LMCache server environment. Unset keeps upstream
+  behaviour.
+- Files: `lmcache/v1/distributed/l2_adapters/nixl_store_dynamic_l2_adapter.py`
+  (`_meow_filename_to_key`; `__init__` calls `_meow_rebuild_index_from_disk`; a
+  `register_listener` override; `_execute_load_in_loop` hands FileNotFoundError keys to
+  `_meow_drop_missing`).
+- Problem: the dynamic adapter answers lookups from an in-memory index and never checks
+  the file. Two failures follow, and each one forces the other:
+  - A file deleted from outside LMCache stays in the index. Every lookup reports a hit,
+    every load fails with FileNotFoundError, and every later store of that key is skipped
+    because the key is still indexed, so the chunk is recomputed on every request until
+    LMCache's own eviction happens to drop the key. On our rig an external job deleted
+    files older than 3 days. Over 9 days the index held 31,663 objects (757 GB) against
+    23,324 files (556 GB) on disk. 10,232 load failures came from 172 keys, the first
+    chunks of shared system prompts, which are stored first and so reach 3 days first.
+    The first request of each agent session recomputed about 30k tokens (TTFT 16-27 s
+    instead of about 1 s).
+  - After a restart the index starts empty. A file is adopted only when a lookup asks for
+    its key, so files that are never asked for again are neither counted against
+    `max_capacity_gb` nor evicted, and they pile up across restarts. That is why the
+    external deletion job existed.
+- Change:
+  1. At start, scan the (flat) storage directory, map each `.bin` name back to its
+     ObjectKey (kept only when the key maps back to the same name), and index the files
+     oldest mtime first, with the adapter's byte count, the base usage count and the
+     per-salt bytes. When a listener (the eviction policy) registers, it gets one
+     `on_l2_keys_stored` call per key in that order, so the oldest file is the first
+     eviction candidate. Same pattern as upstream `RawBlockL2Adapter.register_listener`.
+  2. A load that fails with FileNotFoundError drops the key from the index, subtracts its
+     bytes and notifies the listeners, so the next store writes the file again.
+- Keep when porting: flat layout only (with `shard_dirs` the rebuild is skipped with a
+  warning); `.tmp.*` files are ignored; names that do not map back are counted and
+  skipped; a failing rebuild logs the exception and leaves the upstream empty index; only
+  FileNotFoundError drops a key, other load errors behave as upstream.
+- Signs: the start log has `LMCACHE_MEOW_L2_SYNC: indexed N files`; `GET /status` L2
+  `stored_object_count` matches the `.bin` count on disk; a deleted file gives one
+  `Dynamic NIXL load failed ... FileNotFoundError` per key followed by `dropped N index
+  entries whose file is gone`, not a repeat on every request.
+- Tested: adapter test with real NIXL POSIX and CPU memory in a scratch directory. Switch
+  off reproduces the upstream behaviour (10 checks); switch on passes 15 checks: external
+  delete drops the key, the next store rewrites the file and a reload returns the new
+  bytes, a restart rebuilds the index and byte counts, the oldest file is fed to the
+  policy first, data reads back after restart, and an LMCache delete removes a rebuilt
+  file. Read-only scan of our live directory: 23,324 files, 0 unparsed, 0.16 s. Results
+  after deployment are not in yet.
 
 ### kv_probe (test only)
 
