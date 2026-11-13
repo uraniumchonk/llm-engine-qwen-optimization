@@ -122,8 +122,9 @@ hs=512`, drafter `nh=4 hs=256`. 0.5.6 cannot combine blend mode with
   delete drops the key, the next store rewrites the file and a reload returns the new
   bytes, a restart rebuilds the index and byte counts, the oldest file is fed to the
   policy first, data reads back after restart, and an LMCache delete removes a rebuilt
-  file. Read-only scan of our live directory: 23,324 files, 0 unparsed, 0.16 s. Results
-  after deployment are not in yet.
+  file. Read-only scan of our live directory: 23,324 files, 0 unparsed, 0.16 s. In
+  production since 2026-11-13: the start log indexed 23,324 files (556 GB) and the index
+  count matched the files on disk.
 
 ### kv_probe (test only)
 
