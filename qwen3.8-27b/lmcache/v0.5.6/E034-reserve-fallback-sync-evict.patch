@@ -1,0 +1,456 @@
+diff --git a/lmcache/v1/distributed/storage_controllers/eviction_controller.py b/lmcache/v1/distributed/storage_controllers/eviction_controller.py
+index 9c1a9d7..1626103 100644
+--- a/lmcache/v1/distributed/storage_controllers/eviction_controller.py
++++ b/lmcache/v1/distributed/storage_controllers/eviction_controller.py
+@@ -7,6 +7,7 @@ from __future__ import annotations
+ from abc import abstractmethod
+ from collections import Counter
+ from typing import TYPE_CHECKING
++import os
+ import threading
+ import time
+ 
+@@ -32,6 +33,11 @@ if TYPE_CHECKING:
+ 
+ logger = init_logger(__name__)
+ 
++# E034: on a failed L1 allocation, the caller evicts unlocked objects at once
++# and retries once, instead of waiting for the 1 s watermark loop; off when
++# unset.
++MEOW_SYNC_EVICT = os.environ.get("LMCACHE_MEOW_SYNC_EVICT") == "1"
++
+ 
+ class EvictionController(StorageControllerInterface):
+     """
+@@ -107,6 +113,8 @@ class L1EvictionController(EvictionController):
+         self._l1_manager.register_listener(self._listener)
+         self._event_bus = get_event_bus()
+         self._last_extra_log = time.monotonic()
++        self._meow_evict_lock = threading.Lock()
++        self._meow_stats: Counter = Counter()
+ 
+     def report_status(self) -> dict:
+         return {
+@@ -115,8 +123,60 @@ class L1EvictionController(EvictionController):
+             "eviction_policy": self._eviction_config.eviction_policy,
+             "trigger_watermark": self._eviction_config.trigger_watermark,
+             "eviction_ratio": self._eviction_config.eviction_ratio,
++            "meow_sync_evict": dict(self._meow_stats) if MEOW_SYNC_EVICT else None,
+         }
+ 
++    def meow_evict_bytes(self, need_bytes: int) -> int:
++        """E034: evict about ``need_bytes`` of unlocked L1 objects now, in
++        policy order, for a caller whose L1 allocation just failed. The
++        allocator needs one contiguous free block per object, so free bytes
++        can exceed ``need_bytes`` while the allocation still fails
++        (fragmentation); the target is therefore ``need_bytes`` of new free
++        space, independent of the current usage. Called without the L1Manager
++        lock held (L1Manager.delete takes it). At most 3 policy passes, each
++        asking for at most half of the tracked keys.
++
++        Returns:
++            The bytes freed (usage before minus usage after; another thread
++            may change usage in between).
++        """
++        if need_bytes <= 0:
++            return 0
++        with self._meow_evict_lock:
++            used0, total = self._l1_manager.get_memory_usage()
++            if total <= 0 or used0 <= 0:
++                return 0
++            target = need_bytes
++            freed = 0
++            for _ in range(3):
++                used, _total = self._l1_manager.get_memory_usage()
++                ratio = min(0.5, max(0.01, 1.25 * (target - freed) / max(used, 1)))
++                actions = self._eviction_policy.get_eviction_actions(
++                    ratio,
++                    key_eligible_filter=self._l1_manager.is_key_evictable,
++                )
++                if not actions:
++                    break
++                for action in actions:
++                    self.execute_eviction_action(action)
++                    self._meow_stats["keys"] += len(action.keys)
++                used_after, _total = self._l1_manager.get_memory_usage()
++                freed = used0 - used_after
++                if freed >= target:
++                    break
++            self._meow_stats["calls"] += 1
++            self._meow_stats["bytes_freed"] += max(0, freed)
++            if freed < target:
++                self._meow_stats["short"] += 1
++            logger.info(
++                "E034 sync evict: need %.1f MiB, freed %.1f MiB (usage %.1f%% -> %.1f%%)",
++                target / 2**20,
++                max(0, freed) / 2**20,
++                100.0 * used0 / total,
++                100.0 * (used0 - freed) / total,
++            )
++            return max(0, freed)
++
+     def _publish_skipped(self, usage: float, watermark: float) -> None:
+         """Publish a below-watermark loop tick (no eviction this cycle)."""
+         self._event_bus.publish(
+diff --git a/lmcache/v1/distributed/storage_controllers/prefetch_controller.py b/lmcache/v1/distributed/storage_controllers/prefetch_controller.py
+index de9ad9c..82e1d2f 100644
+--- a/lmcache/v1/distributed/storage_controllers/prefetch_controller.py
++++ b/lmcache/v1/distributed/storage_controllers/prefetch_controller.py
+@@ -21,12 +21,14 @@ from dataclasses import dataclass, field
+ from typing import TYPE_CHECKING
+ import enum
+ import itertools
++import os
+ import select
+ import threading
+ 
+ # First Party
+ from lmcache.lmcache_native import Bitmap
+ from lmcache.logging import init_logger
++from lmcache.utils import get_size_bytes
+ from lmcache.v1.distributed.api import (
+     FetchingPolicy,
+     GroupedObjectKeys,
+@@ -78,6 +80,12 @@ PrefetchRequestId = int
+ # Helper functions
+ 
+ 
++# E034: on a failed L1 reservation, re-plan with a shorter hit cap on the full
++# lookup result (earlier GDN/drafter checkpoint or L1-only prefix) instead of
++# the reserved remainder; off when unset.
++_MEOW_RESERVE_FALLBACK = os.environ.get("LMCACHE_MEOW_RESERVE_FALLBACK") == "1"
++
++
+ def _get_prefetch_write_tag(request_id: PrefetchRequestId) -> str:
+     """Return the L1 write tag of one prefetch request.
+ 
+@@ -223,9 +231,14 @@ def _reserve_l1_cells(
+     cells: Bitmap2D,
+     retain: dict[ObjectKey, bool],
+     tag: str,
++    evict=None,
+ ) -> tuple[Bitmap2D, dict[ObjectKey, "MemoryObj"], int]:
+     """Reserve a staging buffer in one L1 manager for every cell in ``cells``.
+ 
++    E034: with ``evict`` (``L1EvictionController.meow_evict_bytes`` of this
++    manager), a row whose allocation fails evicts that many bytes at once and
++    is retried, up to 3 rounds, until it is reserved or nothing is evicted.
++
+     Each row is reserved with its own key group's layout.
+ 
+     Args:
+@@ -258,6 +271,26 @@ def _reserve_l1_cells(
+             layout_desc=group.layout_desc,
+             tag=tag,
+         )
++        if evict is not None:
++            for _round in range(3):
++                oom_row = [
++                    k for k in keys if results[k][0] == L1Error.OUT_OF_MEMORY
++                ]
++                if not oom_row:
++                    break
++                need = len(oom_row) * get_size_bytes(
++                    group.layout_desc.shapes, group.layout_desc.dtypes
++                )
++                if evict(need) <= 0:
++                    break
++                results.update(
++                    l1_manager.reserve_write(
++                        keys=oom_row,
++                        is_temporary=[not retain[key] for key in oom_row],
++                        layout_desc=group.layout_desc,
++                        tag=tag,
++                    )
++                )
+         for col, key in zip(cols, keys, strict=True):
+             error, mem_obj = results[key]
+             if error != L1Error.SUCCESS or mem_obj is None:
+@@ -684,6 +717,9 @@ class PrefetchController(StorageControllerInterface):
+             "num_l2_adapters": len(self._l2_adapters),
+             "num_active_adapters": len(self._l2_adapters) - len(self._draining),
+             "num_draining_adapters": len(self._draining),
++            "meow_reserve_fallback": dict(getattr(self, "_meow_fallback_stats", {}))
++            if _MEOW_RESERVE_FALLBACK
++            else None,
+         }
+ 
+     def get_adapter_state_observations(
+@@ -1267,6 +1303,9 @@ class PrefetchController(StorageControllerInterface):
+         empty L2 plan no task is submitted and the request is ready to
+         finish.
+         """
++        if _MEOW_RESERVE_FALLBACK and request.fetching_policy == "prefix":
++            self._meow_transition_with_fallback(request)
++            return
+         states = request.key_states
+ 
+         # Step 1 and 2: plan on the lookup results and release what the plan
+@@ -1288,7 +1327,12 @@ class PrefetchController(StorageControllerInterface):
+         cells_by_l1, retain = self._build_l1_allocation_plans(request)
+         for l1_idx, cells in cells_by_l1.items():
+             success, objs, l1_failed_count = _reserve_l1_cells(
+-                self._l1_managers[l1_idx], request.key_groups, cells, retain, tag
++                self._l1_managers[l1_idx],
++                request.key_groups,
++                cells,
++                retain,
++                tag,
++                evict=getattr(self, "_meow_evictors", {}).get(l1_idx),
+             )
+             l1_reserved_keys[l1_idx] = success
+             reserved_objs.update(objs)
+@@ -1344,6 +1388,182 @@ class PrefetchController(StorageControllerInterface):
+         # Step 6: submit the load tasks to L2 adapters
+         self._submit_load_tasks(request, reserved_objs)
+ 
++    def _meow_transition_with_fallback(
++        self, request: InFlightPrefetchRequest
++    ) -> None:
++        """E034 load-phase transition for ``prefix`` requests.
++
++        Every lookup lock stays held until the final plan is known. When an
++        L1 reservation fails, the plan is redone on the full lookup result
++        with the hit capped below the failed plan's hit, so the hit falls back
++        to an earlier GDN/drafter checkpoint (or an L1-only prefix) instead of
++        the reserved remainder. Reservations the new plan does not need are
++        returned before the next reservation pass. The cap only decreases, so
++        the loop ends; a cap of 0 plans nothing.
++
++        On return the locked maps equal the final plan (locally held cells
++        excluded, see E033), the reserved map equals its L2 cells, every
++        other lookup lock is returned, and one load task is in flight per
++        adapter in the plan.
++        """
++        states = request.key_states
++        groups = request.key_groups
++        num_rows = len(groups)
++        num_cols = len(groups[0].keys)
++        windows = [group.sliding_window_size for group in groups]
++        active_l2_descs = {
++            l2_idx: desc
++            for l2_idx, desc in self._adapter_descriptors.items()
++            if l2_idx not in self._draining
++        }
++        tag = _get_prefetch_write_tag(request.request_id)
++        held_l1 = states.l1_locked_keys.copy()
++        held_l2 = states.l2_locked_keys.copy()
++
++        # E033: the leading skip_load_cols columns are held by vLLM; their
++        # locks are returned now and the found cells are presented to the
++        # planner as L1-resident.
++        local: Bitmap2D | None = None
++        if request.skip_load_cols > 0:
++            skip_mask = _leading_cols_mask(num_rows, num_cols, request.skip_load_cols)
++            local = Bitmap2D.zeros(num_rows, num_cols)
++            for l1_idx, grid in list(held_l1.items()):
++                cells = grid & skip_mask
++                keys = _gather_keys(groups, cells)
++                if keys:
++                    self._l1_managers[l1_idx].finish_read(keys, request.num_kv_readers)
++                held_l1[l1_idx] = grid - skip_mask
++                local += cells
++            for l2_idx, grid in list(held_l2.items()):
++                cells = grid & skip_mask
++                keys = _gather_keys(groups, cells)
++                if keys:
++                    self._l2_adapters[l2_idx].submit_unlock(keys)
++                held_l2[l2_idx] = grid - skip_mask
++                local += cells
++
++        def masked(ms: MapState, mask: Bitmap2D) -> MapState:
++            out = MapState()
++            for idx, grid in ms.items():
++                out[idx] = grid & mask
++            return out
++
++        reserved = MapState()
++        reserved_objs: dict[ObjectKey, "MemoryObj"] = {}
++        cap = num_cols
++        first_hit = -1
++        attempts = 0
++        failed_total = 0
++        while True:
++            attempts += 1
++            mask = _leading_cols_mask(num_rows, num_cols, cap)
++            l1_in = masked(held_l1, mask)
++            l2_in = masked(held_l2, mask)
++            if local is not None and self._l1_managers:
++                first_l1 = min(self._l1_managers)
++                local_in = local & mask
++                if first_l1 in l1_in:
++                    l1_in[first_l1] = l1_in[first_l1] + local_in
++                else:
++                    l1_in[first_l1] = local_in
++            plan = self._policy.plan_load(
++                key_groups=groups,
++                l1_locked_keys=l1_in,
++                l2_locked_keys=l2_in,
++                l1_manager_descs=self._l1_manager_descriptors,
++                l2_adapter_descs=active_l2_descs,
++                fetching_policy=request.fetching_policy,
++            )
++            found = Bitmap2D.zeros(num_rows, num_cols)
++            for part in (l1_in.merge(), l2_in.merge()):
++                if len(part) > 0:
++                    found += part
++            hit, _rows = fold_unfold_grouped(found.to_list(), windows)
++            if first_hit < 0:
++                first_hit = hit
++
++            states.l2_locked_keys = plan.l2_planned_keys.copy()
++            cells_by_l1, retain = self._build_l1_allocation_plans(request)
++
++            # Return the reservations this plan does not need first, so their
++            # memory is free for the reservation pass below.
++            for l1_idx, grid in list(reserved.items()):
++                want = cells_by_l1.get(l1_idx)
++                extra = grid - want if want is not None else grid
++                keys = _gather_keys(groups, extra)
++                if keys:
++                    self._l1_managers[l1_idx].finish_write_and_delete(keys, tag=tag)
++                    for key in keys:
++                        reserved_objs.pop(key, None)
++                reserved[l1_idx] = grid - extra
++
++            failed = 0
++            for l1_idx, cells in cells_by_l1.items():
++                need = cells - reserved[l1_idx] if l1_idx in reserved else cells
++                success, objs, l1_failed = _reserve_l1_cells(
++                    self._l1_managers[l1_idx],
++                    groups,
++                    need,
++                    retain,
++                    tag,
++                    evict=getattr(self, "_meow_evictors", {}).get(l1_idx),
++                )
++                if l1_idx in reserved:
++                    reserved[l1_idx] = reserved[l1_idx] + success
++                else:
++                    reserved[l1_idx] = success
++                reserved_objs.update(objs)
++                failed += l1_failed
++            failed_total += failed
++            if failed == 0:
++                break
++            cap = max(0, hit - 1)
++
++        final_l1 = plan.l1_planned_keys
++        final_l2 = plan.l2_planned_keys
++        for l1_idx, grid in held_l1.items():
++            drop = grid - final_l1[l1_idx] if l1_idx in final_l1 else grid
++            keys = _gather_keys(groups, drop)
++            if keys:
++                self._l1_managers[l1_idx].finish_read(keys, request.num_kv_readers)
++        for l2_idx, grid in held_l2.items():
++            drop = grid - final_l2[l2_idx] if l2_idx in final_l2 else grid
++            keys = _gather_keys(groups, drop)
++            if keys:
++                self._l2_adapters[l2_idx].submit_unlock(keys)
++
++        states.l1_locked_keys = final_l1.copy()
++        states.l2_locked_keys = final_l2.copy()
++        if local is not None:
++            planned = final_l1.merge()
++            request.local_found = (
++                local & planned if len(planned) > 0 else local.zeros_like()
++            )
++            for l1_idx, grid in list(states.l1_locked_keys.items()):
++                states.l1_locked_keys[l1_idx] = grid - local
++        states.l1_reserved_keys = reserved
++        stats = getattr(self, "_meow_fallback_stats", None)
++        if stats is None:
++            stats = self._meow_fallback_stats = Counter()
++        stats["requests"] += 1
++        if failed_total > 0:
++            stats["failed_reservations"] += failed_total
++            stats["fallback_requests"] += 1
++            stats["chunks_lost"] += max(0, first_hit - hit)
++            if hit == 0:
++                stats["fallback_to_zero"] += 1
++            logger.info(
++                "E034 reserve fallback: request %d hit %d -> %d chunks, "
++                "%d attempts, %d failed reservations",
++                request.request_id,
++                first_hit,
++                hit,
++                attempts,
++                failed_total,
++            )
++
++        self._submit_load_tasks(request, reserved_objs)
++
+     def _submit_load_tasks(
+         self,
+         request: InFlightPrefetchRequest,
+diff --git a/lmcache/v1/distributed/storage_manager.py b/lmcache/v1/distributed/storage_manager.py
+index 239a652..7092062 100644
+--- a/lmcache/v1/distributed/storage_manager.py
++++ b/lmcache/v1/distributed/storage_manager.py
+@@ -14,6 +14,7 @@ import time
+ # First Party
+ from lmcache.lmcache_native import PeriodicEventNotifier
+ from lmcache.logging import init_logger
++from lmcache.utils import get_size_bytes
+ from lmcache.v1.distributed.api import (
+     CapacitySnapshot,
+     L1BackendType,
+@@ -60,6 +61,9 @@ from lmcache.v1.distributed.storage_controllers import (
+     PrefetchController,
+     StoreController,
+ )
++from lmcache.v1.distributed.storage_controllers.eviction_controller import (
++    MEOW_SYNC_EVICT,
++)
+ from lmcache.v1.distributed.storage_controllers.prefetch_policy import (
+     create_prefetch_policy,
+ )
+@@ -268,6 +272,19 @@ class StorageManager:
+                 policy=create_prefetch_policy(config.prefetch_policy),
+                 max_in_flight=config.prefetch_max_in_flight,
+             )
++            if MEOW_SYNC_EVICT:
++                # E034: per L1 manager id, the synchronous eviction its
++                # callers run after a failed allocation.
++                self._meow_evictors = {
++                    m.l1_manager_id: ec.meow_evict_bytes
++                    for m, ec in zip(managers, self._eviction_controllers, strict=True)
++                }
++                self._prefetch_controller._meow_evictors = self._meow_evictors
++                logger.info(
++                    "E034 LMCACHE_MEOW_SYNC_EVICT=1: synchronous L1 eviction on "
++                    "failed allocations for managers %s",
++                    sorted(self._meow_evictors),
++                )
+             self._prefetch_controller.start()
+             cleanup.callback(self._prefetch_controller.stop)
+ 
+@@ -323,6 +340,28 @@ class StorageManager:
+                 layout_desc=layout_desc,
+                 tag=_L1_WRITE_TAG,
+             )
++            evict = getattr(self, "_meow_evictors", {}).get(manager.l1_manager_id)
++            if evict is not None:
++                # E034: evict at once and retry the OOM subset, up to 3 rounds.
++                for _round in range(3):
++                    oom = [
++                        k for k in pending if results[k][0] == L1Error.OUT_OF_MEMORY
++                    ]
++                    if not oom:
++                        break
++                    need = len(oom) * get_size_bytes(
++                        layout_desc.shapes, layout_desc.dtypes
++                    )
++                    if evict(need) <= 0:
++                        break
++                    results.update(
++                        manager.reserve_write(
++                            keys=oom,
++                            is_temporary=[False] * len(oom),
++                            layout_desc=layout_desc,
++                            tag=_L1_WRITE_TAG,
++                        )
++                    )
+             reserve_result.update(results)
+             # Retry the failed batch subset, never individual allocations or
+             # terminal conflicts. Each candidate is visited at most once.

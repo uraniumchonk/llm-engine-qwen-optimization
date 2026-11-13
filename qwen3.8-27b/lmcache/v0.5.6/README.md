@@ -11,6 +11,7 @@ Scope: written for Qwen3.8-27B (48 GDN + 16 attention layers) with the DFlash2 d
 | E014 | `LMCACHE_MEOW_CKPT_K=<int>` in the vLLM process | new `lmcache/integration/vllm/meow_checkpoint.py`, `lmcache/integration/vllm/lmcache_mp_connector.py` |
 | E030 | `LMCACHE_MEOW_L2_SYNC=1` in the LMCache server | `lmcache/v1/distributed/l2_adapters/nixl_store_dynamic_l2_adapter.py` |
 | E033 | `LMCACHE_MEOW_LOCAL_SKIP=1` in the LMCache server and the vLLM process; `LMCACHE_MEOW_LOOKUP_WAIT_MS=<ms>` in the vLLM process | `lmcache/integration/vllm/lmcache_mp_connector.py`, `lmcache/integration/vllm/vllm_multi_process_adapter.py`, `lmcache/v1/distributed/api.py`, `lmcache/v1/distributed/storage_controllers/prefetch_controller.py`, `lmcache/v1/multiprocess/modules/lookup.py`, `lmcache/v1/multiprocess/modules/lmcache_driven_transfer.py` |
+| E034 | `LMCACHE_MEOW_RESERVE_FALLBACK=1` and `LMCACHE_MEOW_SYNC_EVICT=1` in the LMCache server (we run them with `--l2-store-policy default`) | `lmcache/v1/distributed/storage_controllers/prefetch_controller.py`, `lmcache/v1/distributed/storage_controllers/eviction_controller.py`, `lmcache/v1/distributed/storage_manager.py` |
 | kv_probe (test only, `test-only/`) | `LMCACHE_MEOW_KV_PROBE=1` in the LMCache server | `lmcache/v1/multiprocess/modules/lmcache_driven_transfer.py` |
 
 Build note: the 0.5.6 PyPI wheel's `lmcache.cuda_ops` is built against torch 2.13. Under
@@ -192,7 +193,71 @@ hs=512`, drafter `nh=4 hs=256`. 0.5.6 cannot combine blend mode with
 - Upstream behaviour seen while testing (not changed here): for hybrid models the first
   plan returns the locks of every earlier GDN and drafter cell, so when the L1 reservation
   of the last chunk fails, the replan finds no GDN cell to end on and the hit drops to 0
-  instead of falling back to an earlier chunk.
+  instead of falling back to an earlier chunk. E034 changes this.
+
+### E034 Keep stored chunks in L1: evict at once when an L1 allocation fails, and shorten the hit instead of dropping it
+
+- Switches: `LMCACHE_MEOW_RESERVE_FALLBACK=1` (reserve fallback) and `LMCACHE_MEOW_SYNC_EVICT=1`
+  (synchronous eviction), both in the LMCache server. Unset keeps upstream behaviour. We run
+  them with `--l2-store-policy default` instead of `skip_l1`.
+- Files: `lmcache/v1/distributed/storage_controllers/prefetch_controller.py`
+  (`_meow_transition_with_fallback`, the `evict` hook of `_reserve_l1_cells`, status
+  `meow_reserve_fallback`); `lmcache/v1/distributed/storage_controllers/eviction_controller.py`
+  (`L1EvictionController.meow_evict_bytes`, status `meow_sync_evict`);
+  `lmcache/v1/distributed/storage_manager.py` (eviction retry in `reserve_write`, wiring of the
+  evictors at construction).
+- Problem:
+  - With `--l2-store-policy skip_l1` a stored chunk lives only in L2. When vLLM's own prefix
+    cache has dropped a prefix, the next request reads it back from disk: on our rig a
+    10K-token prefix meant 433.4 MB read and 372-390 ms; with `default` (stored chunks stay in
+    L1) the same step read 0 MB and took 300-307 ms.
+  - With chunks kept in L1, the L1 fills up to its watermark and allocations fail more often,
+    and upstream handles a failure badly: a failed allocation evicts nothing (only the
+    once-a-second watermark loop evicts); the prefetch reserves a whole row (object group x
+    kv rank) in one all-or-nothing call; and for hybrid models the first plan has already
+    returned the locks of earlier GDN and drafter cells, so the replan after a failed
+    reservation finds no GDN cell to end on and the LMCache hit drops to 0. In a test with a
+    1 GB L1 both failures upstream lost the whole LMCache hit, one of them short by 1-2
+    blocks of 26 MB.
+  - The L1 allocator carves one contiguous block per object from a free list, so free bytes
+    can exceed a row's need while the allocation still fails.
+- Change:
+  1. Reserve fallback (prefix requests only): every lookup lock is held until the final plan.
+     When a reservation fails, the plan is redone on the full lookup result with the hit
+     capped below the failed plan's hit, so the hit falls to an earlier GDN/drafter
+     checkpoint or an L1-only prefix. Reservations the new plan does not need are returned
+     before the next reservation pass. The cap only decreases; a cap of 0 plans nothing.
+     E033's locally held cells are still presented as L1-resident.
+  2. Synchronous eviction: when a prefetch row or a store allocation fails, the caller asks
+     that L1's eviction controller to evict about the needed bytes of unlocked objects in
+     policy order (at most 3 passes, each at most half of the tracked keys) and retries, up
+     to 3 rounds, stopping when reserved or when nothing is evicted. It is called outside the
+     L1Manager lock, because `delete` takes the same non-reentrant lock.
+- Keep when porting: only keys for which `is_key_evictable` is true are evicted (no read lock,
+  no write in progress); the fallback only shortens hits, loads go through the upstream
+  retrieve; with the switches unset, or a fetching policy other than `prefix`, upstream code
+  runs.
+- Signs: `GET /status` shows `prefetch_controller.meow_reserve_fallback` and
+  `l1_eviction_controller.meow_sync_evict` as dicts (None means the switch was not read); log
+  lines `E034 sync evict` and `E034 reserve fallback` (`-> 0 chunks` should be rare);
+  `read_locked_count` and `write_locked_count` 0 at rest.
+- Tested: an offline test that drives the real prefetch load phase, `DefaultPrefetchPolicy` and
+  `L1EvictionController` with LRU over a fake L1 with a byte budget, all-or-nothing row
+  allocation and optional fragmentation: in 9 fixed cases the upstream / E034 hit was 8/8 with
+  no failure and 0/4 for a failed attention row, a failed GDN tail cell, chunks 0-3 already in
+  L1 and a contended cell; synchronous eviction 0 -> 8; fragmented L1 0 -> 8. Over 3,000 random
+  cases E034 gave a higher hit in 411, an equal hit in 2,589, a lower hit in none, with no lock,
+  reservation or memory accounting error. The LMCache 0.5.6 test suite passes except the one
+  test that asserts an empty hit after a row runs out of memory (E034 returns the shorter hit;
+  with that expectation the lock and staging checks pass). On the test instance, four agent
+  chains in parallel (25 turns each): with a 3 GB or 20 GB L1 no allocation failed; with a
+  1 GB L1 upstream lost the LMCache hit twice (a 16,000-token load fell to vLLM's own 6,464),
+  while E034 kept the full 16,000 on the same step in all 4 rounds (18 synchronous evictions,
+  2.18 GB freed) and fell back 16 -> 4, 18 -> 17 and 16 -> 8 chunks where 1 GB could not hold
+  the load, never to 0. LMCache loads were identical to a cold recompute (KL 0) in every
+  setting; check turns stayed within the 9.4e-4 concurrency floor; no lock was left. The L1 is
+  fully pinned at start (81,920 MB at usage 0), so keeping chunks adds no RAM. In production
+  since 2026-11-14: the request after a 10K-token store took 64.9 ms with 0 MB read.
 
 ### kv_probe (test only)
 

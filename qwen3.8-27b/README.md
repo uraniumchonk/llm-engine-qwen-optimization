@@ -1,7 +1,7 @@
 # Qwen3.8-27B on 2× RTX 3090
 
 vLLM and LMCache patches for Qwen3.8-27B, a hybrid Gated DeltaNet (GDN) model, served
-with a DFlash2 speculative drafter. In our production since 2026-11-04 (E031 and E033 since 2026-11-13).
+with a DFlash2 speculative drafter. In our production since 2026-11-04 (E031 and E033 since 2026-11-13, E034 since 2026-11-14).
 
 Agents start at [AGENTS.md](../AGENTS.md). Every experiment behind these patches:
 [results](results/README.md); where a decode step's time goes:
@@ -37,7 +37,7 @@ enough detail to port it yourself.
 |---|---|---|---|
 | vLLM 0.33.0 | [`vllm/v0.33.0`](vllm/v0.33.0/README.md) | E003, E005, E006a, E006b, E006c, E031 | in our production since 2026-11-04 (E031 since 2026-11-13) |
 | vLLM 0.28.0 | [`vllm/v0.28.0`](vllm/v0.28.0/README.md) | E003 | A/B on 2026-11-03 |
-| LMCache 0.5.6 | [`lmcache/v0.5.6`](lmcache/v0.5.6/README.md) | E014, E030, E033, plus kv_probe (test only) | in our production since 2026-11-04 (E030 and E033 since 2026-11-13) |
+| LMCache 0.5.6 | [`lmcache/v0.5.6`](lmcache/v0.5.6/README.md) | E014, E030, E033, E034, plus kv_probe (test only) | in our production since 2026-11-04 (E030 and E033 since 2026-11-13, E034 since 2026-11-14) |
 
 | Patch | What it does | Switch | Measured on our rig |
 |---|---|---|---|
@@ -47,8 +47,9 @@ enough detail to port it yourself.
 | E031 | Prefix-cache hits on a 64-token grid inside the 1600-token block: the drafter's sliding-window group supports fine-grained lookup, and the copy-on-write block copy no longer skips the attention/drafter KV view that shares its start address with the GDN view | `VLLM_E031_SWA_FINE_HITS=1` plus `--prefix-match-unit 64` | agent turns with a fixed system prompt and tools (29.5K tokens): TTFT p50 796 → 230 ms, p90 1,247 → 538 ms; 64-grid hits vs recompute KL 6.7e-4 (concurrency noise floor 9.4e-4) |
 | E014 | LMCache stores GDN and drafter state only at checkpoint chunks; attention KV is stored for every chunk | `LMCACHE_MEOW_CKPT_K=4` | L2 bytes −43% on our workload |
 | E033 | LMCache lookups count the chunks vLLM already holds without loading or locking them, and vLLM waits a few ms for the lookup answer instead of two scheduler steps | `LMCACHE_MEOW_LOCAL_SKIP=1` (server and vLLM), `LMCACHE_MEOW_LOOKUP_WAIT_MS=5` (vLLM) | request after a 10K-token store 152 → 66 ms and 433 → 0 MB read; 4 parallel agent chains: logged lookup 396 → 31 ms, TTFT p90 5.5 → 4.1 s |
+| E034 | LMCache keeps stored chunks in L1 (`--l2-store-policy default`); a failed L1 allocation evicts unlocked objects at once and retries, and a reservation that still fails shortens the hit to an earlier checkpoint instead of dropping it to 0 | `LMCACHE_MEOW_RESERVE_FALLBACK=1`, `LMCACHE_MEOW_SYNC_EVICT=1` (server) | after vLLM drops a 10K-token prefix: 433.4 MB disk read, 372-390 ms -> 0 MB, 300-307 ms; 1 GB L1 stress: hits dropped to 0 twice upstream, never with E034 |
 
-With the switch unset, E003, E005, E014, E031 and E033 leave upstream behaviour unchanged.
+With the switch unset, E003, E005, E014, E031, E033 and E034 leave upstream behaviour unchanged.
 
 ## Test rig
 
