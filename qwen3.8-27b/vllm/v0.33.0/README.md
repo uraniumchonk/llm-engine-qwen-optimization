@@ -148,3 +148,37 @@ those ranges also held production-sampling runs. The greedy runs are above (run 
   logit KL vs off 4.1e-4, against a same-build run-to-run floor of 1.7e-4 under
   concurrency. Rebuilding the tree or the compile cache alone gives about 4.5e-4.
 - Written by: Claude.
+
+### E031 64-token prefix-cache hits on the hybrid stack (plus a CoW block-copy fix)
+
+- Switch: off unless both `VLLM_E031_SWA_FINE_HITS=1` and `--prefix-match-unit 64` are set.
+  `VLLM_E031_DEBUG=1` adds hit / copy-on-write / tail-key / Mamba-slot logs and a byte check of
+  every per-layer tensor after the first `VLLM_E031_DEBUG_VERIFY_N` (40) block copies.
+- Files: `vllm/v1/core/single_type_kv_cache_manager.py` (`SlidingWindowManager` fine-grained
+  lookup and prompt-tail partial key), `vllm/v1/worker/utils.py` (`copy_kv_cache_blocks_inplace`),
+  `vllm/v1/worker/mamba_utils.py` (debug log only).
+- Problem: agent-loop TTFT cycled between about 200 and 900 ms with the distance of the previous
+  prompt from a multiple of the 1600-token block, because prefix hits landed only on the block
+  grid. vLLM 0.33 has `--prefix-match-unit` with prompt-tail Mamba states, but fine-grained hits
+  were switched off because the DFlash drafter's sliding-window manager does not support them.
+  Turning them on exposed a second bug: a hit that resumes mid-block copies the tail block
+  first, and the copy de-duplicated per-layer tensors by start address. With the E005 grouping
+  the GDN state view and the attention/drafter KV view of one layer slot start at the same
+  address, so the KV view was skipped and the resumed request read partly zeroed KV (KL vs a
+  full recompute 1.2e-2, 13x the concurrency noise floor).
+- Change: no kernel change. The scheduler already splits the prefill at the prompt's last
+  64-token boundary and keeps the Mamba state there; the drafter's sliding-window group now
+  searches final lengths on the 64-token grid and registers the prompt-tail key like full
+  attention. The block copy de-duplicates by (address, shape, stride, dtype).
+- Keep when porting: with the switch and flag unset the behaviour is the stock one (the copy
+  fix only runs when copy-on-write happens). DFlash does not drop an EAGLE block, so tail keys
+  and Mamba tail states sit at floor((P-1)/64)*64. Conversations that rewrite earlier messages
+  fall back to the block grid.
+- Measured (2x RTX 3090, replay of four stored agent chains, max_tokens 1): 29.5K-token chains
+  with a fixed system prompt and tools p50 796 / 805 -> 230 / 229 ms, p90 1,247 / 948 -> 538 /
+  497 ms; rewriting and short chains unchanged. After the fix: the same prompt sent twice
+  (second send resumes mid-block) is bitwise identical; a mid-block GPU hit extended by LMCache
+  chunks is bitwise identical to a fresh recompute; 64-grid hits vs recompute KL 6.7e-4 against
+  a 9.4e-4 concurrency noise floor; drafter acceptance 0.242 vs 0.241.
+- Written by: Claude (host).
+
